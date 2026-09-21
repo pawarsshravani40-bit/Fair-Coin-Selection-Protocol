@@ -1,0 +1,25 @@
+{
+  "name": "fair-coin-selection-protocol",
+  "version": "1.0.0",
+  "description": "A Cryptographically Secure and Verifiable Random Selection Protocol for Multiple Participants",
+  "main": "server/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test test/protocol.test.js"
+  },
+  "keywords": [
+    "cryptography",
+    "commit-reveal",
+    "fair-coin",
+    "random-selection",
+    "unbiased",
+    "socket.io"
+  ],
+  "author": "Shravani",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
+}

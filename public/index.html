@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fair Coin Selection Protocol</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-shield">🛡️</span>
+        <div>
+          <h1>FAIR PICK</h1>
+          <p class="subtitle">A Cryptographically Secure and Verifiable Random Selection Protocol for Multiple Participants</p>
+        </div>
+      </div>
+      <nav class="nav-links">
+        <button id="navGameBtn" class="nav-btn active">Protocol Game</button>
+        <button id="navFairnessBtn" class="nav-btn">Fairness Simulation</button>
+        <button id="navAttackBtn" class="nav-btn">Attack Sandbox</button>
+      </nav>
+    </header>
+
+    <!-- Notification Bar -->
+    <div id="alertBanner" class="alert-banner hidden"></div>
+
+    <!-- MAIN VIEW: PROTOCOL GAME -->
+    <main id="gameSection" class="view-section">
+      <!-- 1. HOME SCREEN -->
+      <section id="homeView" class="card hero-card">
+        <div class="hero-content">
+          <div class="hero-badge">Commit–Reveal Cryptography</div>
+          <h2>Unbiased Multi-Party Random Selection</h2>
+          <p class="hero-desc">
+            Select exactly one winner among 3–20 participants with provably equal probability (\(1/n\)),
+            backed by SHA-256 commitments, bitwise XOR entropy combination, and zero-bias rejection sampling.
+          </p>
+          <div class="home-actions">
+            <button id="openCreateBtn" class="btn btn-primary btn-large">Create Game</button>
+            <button id="openJoinBtn" class="btn btn-secondary btn-large">Join Game</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. CREATE GAME MODAL / FORM -->
+      <section id="createView" class="card form-card hidden">
+        <h3>Create New Game</h3>
+        <p class="form-instruction">Configure session parameters as host</p>
+        <div class="form-group">
+          <label for="createNameInput">Your Name</label>
+          <input type="text" id="createNameInput" placeholder="Alice" maxlength="24" value="Alice">
+        </div>
+        <div class="form-group">
+          <label for="createCountInput">Number of Participants (3 – 20)</label>
+          <div class="range-row">
+            <input type="range" id="createCountRange" min="3" max="20" value="3">
+            <span id="createCountDisplay" class="count-badge">3</span>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button id="cancelCreateBtn" class="btn btn-outline">Cancel</button>
+          <button id="submitCreateBtn" class="btn btn-primary">Create Room</button>
+        </div>
+      </section>
+
+      <!-- 3. JOIN GAME MODAL / FORM -->
+      <section id="joinView" class="card form-card hidden">
+        <h3>Join Existing Game</h3>
+        <p class="form-instruction">Enter the 6-character room code from your host</p>
+        <div class="form-group">
+          <label for="joinNameInput">Your Name</label>
+          <input type="text" id="joinNameInput" placeholder="Bob" maxlength="24" value="Bob">
+        </div>
+        <div class="form-group">
+          <label for="joinCodeInput">Room Code</label>
+          <input type="text" id="joinCodeInput" placeholder="e.g. 7X9K2A" maxlength="6" class="code-input">
+        </div>
+        <div class="form-actions">
+          <button id="cancelJoinBtn" class="btn btn-outline">Cancel</button>
+          <button id="submitJoinBtn" class="btn btn-primary">Join Room</button>
+        </div>
+      </section>
+
+      <!-- 4. LOBBY VIEW -->
+      <section id="lobbyView" class="card hidden">
+        <div class="lobby-header">
+          <div>
+            <span class="tag">ROOM LOBBY</span>
+            <div class="room-code-badge">
+              Room Code: <strong id="lobbyRoomCode">------</strong>
+              <button id="copyCodeBtn" class="btn btn-sm" title="Copy Code">📋 Copy</button>
+            </div>
+          </div>
+          <div class="participant-counter">
+            <span id="lobbyCountDisplay">1</span> / <span id="lobbyMaxDisplay">3</span> Participants
+          </div>
+        </div>
+
+        <div class="roster-container">
+          <h4>Participants in Lobby</h4>
+          <ul id="lobbyRoster" class="participant-list"></ul>
+        </div>
+
+        <div class="lobby-actions">
+          <button id="startProtocolBtn" class="btn btn-primary btn-large hidden">Start Selection</button>
+          <div id="lobbyWaitingMsg" class="waiting-indicator">Waiting for all participants to join...</div>
+        </div>
+      </section>
+
+      <!-- 5. PROTOCOL RUNTIME VIEW -->
+      <section id="protocolView" class="card hidden">
+        <!-- Stage Flow Progress -->
+        <div class="protocol-stepper">
+          <div id="stepCommit" class="step-item active">
+            <span class="step-num">1</span>
+            <span class="step-label">Commit Phase</span>
+          </div>
+          <div class="step-line"></div>
+          <div id="stepLock" class="step-item">
+            <span class="step-num">2</span>
+            <span class="step-label">Commitments Locked</span>
+          </div>
+          <div class="step-line"></div>
+          <div id="stepReveal" class="step-item">
+            <span class="step-num">3</span>
+            <span class="step-label">Reveal Phase</span>
+          </div>
+          <div class="step-line"></div>
+          <div id="stepWinner" class="step-item">
+            <span class="step-num">4</span>
+            <span class="step-label">Winner</span>
+          </div>
+        </div>
+
+        <!-- Lock Announcement Banner -->
+        <div id="lockedBanner" class="locked-banner hidden">
+          COMMITMENTS LOCKED 🔐
+        </div>
+
+        <!-- Participant Protocol Table -->
+        <div class="table-container">
+          <table class="protocol-table">
+            <thead>
+              <tr>
+                <th>Participant</th>
+                <th>Role</th>
+                <th>Commitment (SHA-256)</th>
+                <th>Secret Status</th>
+                <th>Verification</th>
+              </tr>
+            </thead>
+            <tbody id="protocolTableBody"></tbody>
+          </table>
+        </div>
+
+        <!-- Participant Local Cryptographic Controls -->
+        <div id="localActionBox" class="local-crypto-box">
+          <div class="box-header">
+            <h4>🔐 Client Cryptographic Station</h4>
+            <span class="local-badge" id="clientIdentityBadge">You: Not connected</span>
+          </div>
+
+          <!-- Secret generation and commit stage -->
+          <div id="commitControls" class="control-row">
+            <div class="crypto-preview">
+              <label>Your Client Secret (Generated locally with Web Crypto API):</label>
+              <div class="hash-box" id="localSecretDisplay">Pending generation...</div>
+              <label>Your Commitment: SHA-256(Participant ID || Secret)</label>
+              <div class="hash-box" id="localCommitmentDisplay">Pending computation...</div>
+            </div>
+            <div class="action-buttons">
+              <button id="commitActionBtn" class="btn btn-primary">Generate & Commit Secret</button>
+            </div>
+          </div>
+
+          <!-- Reveal Stage -->
+          <div id="revealControls" class="control-row hidden">
+            <div class="crypto-preview">
+              <p class="info-text">Commitments are locked. Submit your secret to the server for SHA-256 verification.</p>
+            </div>
+            <div class="action-buttons">
+              <button id="revealActionBtn" class="btn btn-success">Reveal Secret (Valid)</button>
+              <button id="attackDemoBtn" class="btn btn-danger">Simulate Cheating Attack</button>
+            </div>
+          </div>
+
+          <!-- Timeout trigger -->
+          <div id="timeoutControls" class="timeout-row hidden">
+            <button id="forceTimeoutBtn" class="btn btn-outline btn-sm">Force Timeout for Non-Revealers</button>
+          </div>
+        </div>
+
+        <!-- WINNER SECTION -->
+        <div id="winnerSection" class="winner-box hidden">
+          <div class="winner-crown">👑</div>
+          <h2 class="winner-title">🎉 WINNER 🎉</h2>
+          <div class="winner-name" id="winnerNameDisplay">---</div>
+
+          <div class="winner-checklist">
+            <div class="check-item">✓ All commitments verified</div>
+            <div class="check-item">✓ All reveals verified</div>
+            <div class="check-item">✓ Randomness combined</div>
+            <div class="check-item">✓ Unbiased selection completed</div>
+          </div>
+
+          <button id="toggleAuditBtn" class="btn btn-secondary">View Cryptographic Audit Details</button>
+        </div>
+
+        <!-- AUDIT & VERIFICATION DRAWER -->
+        <div id="auditDrawer" class="audit-drawer hidden">
+          <h3>Cryptographic Verification Audit</h3>
+          <div class="audit-grid">
+            <div class="audit-card">
+              <h4>Combined Randomness (Bitwise XOR)</h4>
+              <p class="formula">\(R = R_1 \oplus R_2 \oplus \dots \oplus R_n\)</p>
+              <div class="hash-box" id="auditCombinedSeed">---</div>
+            </div>
+            <div class="audit-card">
+              <h4>Unbiased Rejection Sampling</h4>
+              <p class="formula">Limits: \(0 \le V < 2^{64} - (2^{64} \pmod n)\)</p>
+              <div class="audit-stats">
+                <div>Sample 64-bit Int: <strong id="auditSampleVal">---</strong></div>
+                <div>Rejections Required: <strong id="auditRejections">0</strong></div>
+                <div>Selected Index: <strong id="auditIndex">---</strong></div>
+              </div>
+            </div>
+          </div>
+
+          <h4>Per-Participant Commitment & Reveal Log</h4>
+          <div class="table-container">
+            <table class="protocol-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Commitment Hash</th>
+                  <th>Revealed Secret</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="auditTableBody"></tbody>
+            </table>
+          </div>
+
+          <div class="drawer-actions">
+            <button id="newGameBtn" class="btn btn-primary">Play Again</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- FAIRNESS SIMULATION VIEW -->
+    <section id="fairnessSection" class="view-section card hidden">
+      <div class="section-title">
+        <h2>Statistical Fairness & Uniformity Testing</h2>
+        <p class="subtitle">Run thousands of automated selection simulations to empirically verify the \(1/n\) distribution</p>
+      </div>
+
+      <div class="simulation-controls">
+        <div class="form-group">
+          <label for="simNSelect">Participants (n):</label>
+          <select id="simNSelect" class="select-input">
+            <option value="3">n = 3 (33.333% expected)</option>
+            <option value="4">n = 4 (25.000% expected)</option>
+            <option value="5" selected>n = 5 (20.000% expected)</option>
+            <option value="10">n = 10 (10.000% expected)</option>
+            <option value="20">n = 20 (5.000% expected)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="simTrialsSelect">Trials:</label>
+          <select id="simTrialsSelect" class="select-input">
+            <option value="1000">1,000 trials</option>
+            <option value="5000">5,000 trials</option>
+            <option value="10000" selected>10,000 trials</option>
+            <option value="25000">25,000 trials</option>
+            <option value="50000">50,000 trials</option>
+          </select>
+        </div>
+
+        <button id="runSimBtn" class="btn btn-primary">Run Fairness Simulation</button>
+      </div>
+
+      <!-- Simulation Summary Statistics -->
+      <div id="simStatsRow" class="stats-row hidden">
+        <div class="stat-card">
+          <span class="stat-label">Expected Probability</span>
+          <span class="stat-value" id="simExpectedPct">---</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Max Observed Deviation</span>
+          <span class="stat-value" id="simMaxDev">---</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Chi-Square Statistic (\(\chi^2\))</span>
+          <span class="stat-value" id="simChiSquare">---</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Modulo Rejections</span>
+          <span class="stat-value" id="simRejections">---</span>
+        </div>
+      </div>
+
+      <!-- Chart Container (Dynamically rendered DOM bars) -->
+      <div class="chart-container">
+        <h3>Distribution Chart (Observed Win % vs Expected)</h3>
+        <div id="barsWrapper" class="bars-wrapper">
+          <p class="chart-placeholder">Click "Run Fairness Simulation" to generate chart.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ATTACK DEMONSTRATION SANDBOX -->
+    <section id="attackSection" class="view-section card hidden">
+      <div class="section-title">
+        <h2>Cheating Attack & Tamper Detection Sandbox</h2>
+        <p class="subtitle">Demonstrating the preimage resistance and binding properties of SHA-256 commitments</p>
+      </div>
+
+      <div class="sandbox-grid">
+        <div class="sandbox-card">
+          <h3>1. Genuine Secret & Commitment</h3>
+          <p>Participant submits commitment during the Commit Phase:</p>
+          <div class="form-group">
+            <label>Original Secret:</label>
+            <input type="text" id="demoOriginalSecret" value="123456" class="code-input">
+          </div>
+          <div class="form-group">
+            <label>Computed SHA-256 Commitment:</label>
+            <div class="hash-box" id="demoOriginalCommitment">Calculating...</div>
+          </div>
+        </div>
+
+        <div class="sandbox-card">
+          <h3>2. Attacker Tampered Reveal</h3>
+          <p>Attacker attempts to change their secret during the Reveal Phase:</p>
+          <div class="form-group">
+            <label>Attempted Reveal Secret:</label>
+            <input type="text" id="demoTamperedSecret" value="999999" class="code-input">
+          </div>
+          <div class="form-group">
+            <label>Attacker Hash (What server checks):</label>
+            <div class="hash-box" id="demoTamperedCommitment">Calculating...</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sandbox-action">
+        <button id="testTamperBtn" class="btn btn-danger btn-large">Verify Tampered Reveal</button>
+      </div>
+
+      <div id="tamperResultBox" class="tamper-result hidden">
+        <div class="alert-box-danger">
+          <h3>❌ ATTACK DETECTED</h3>
+          <p>Commitment verification failed.</p>
+          <p>Reveal rejected.</p>
+          <div class="tamper-details">
+            <div>Expected Commitment: <code id="tamperExpected"></code></div>
+            <div>Stored Commitment: <code id="tamperStored"></code></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <p>Fair Coin Selection Protocol — Cryptographically Secure Commit–Reveal Multi-Party Coin Toss</p>
+      <p class="disclaimer">Academic demonstration of cryptographic fairness. Node.js • Web Crypto API • Socket.IO</p>
+    </footer>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
