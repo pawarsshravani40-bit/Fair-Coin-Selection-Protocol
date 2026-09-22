@@ -79,18 +79,30 @@ To guarantee strict mathematical fairness, we implement rejection sampling:
 
 ## 4. Installation & Running
 
-### Prerequisites
-- Node.js (v18+) & npm
+### Option A: Python (Zero npm / Node-free)
 
-### Installation
+If you do not have Node.js / npm installed:
+```bash
+python server.py
+```
+Open your browser and navigate to:
+```text
+http://localhost:3000
+```
+Run Python test suite:
+```bash
+python test_server.py
+```
+
+---
+
+### Option B: Node.js & npm
+
+Prerequisites: Node.js (v18+) & npm
 ```bash
 git clone https://github.com/Shravani-Pawar/Fair-Coin-Selection-Protocol.git
 cd Fair-Coin-Selection-Protocol
 npm install
-```
-
-### Starting the Server
-```bash
 npm start
 ```
 Open your browser and navigate to:

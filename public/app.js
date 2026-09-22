@@ -184,6 +184,18 @@ startProtocolBtn.addEventListener('click', () => {
   });
 });
 
+// Add Bot Participant
+const addBotBtn = document.getElementById('addBotBtn');
+if (addBotBtn) {
+  addBotBtn.addEventListener('click', () => {
+    socket.emit('add_bot', (response) => {
+      if (!response.success) {
+        showAlert(response.error, 'danger');
+      }
+    });
+  });
+}
+
 // Update Lobby UI
 function updateLobbyUI(room) {
   document.getElementById('lobbyRoomCode').textContent = room.code;
@@ -211,8 +223,17 @@ function updateLobbyUI(room) {
       startProtocolBtn.classList.add('hidden');
       waitingMsg.textContent = `Need at least 3 participants to start (${room.participantCount} currently).`;
     }
+
+    if (addBotBtn) {
+      if (room.participantCount < room.requiredParticipants) {
+        addBotBtn.classList.remove('hidden');
+      } else {
+        addBotBtn.classList.add('hidden');
+      }
+    }
   } else {
     startProtocolBtn.classList.add('hidden');
+    if (addBotBtn) addBotBtn.classList.add('hidden');
     waitingMsg.textContent = `Waiting for host to start selection... (${room.participantCount}/${room.requiredParticipants} joined)`;
   }
 }
