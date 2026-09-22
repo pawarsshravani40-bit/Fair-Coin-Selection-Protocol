@@ -99,6 +99,133 @@ def unbiased_select(seed_bytes: bytes, n: int) -> dict:
         rejections += 1
         curr = hashlib.sha256(curr).digest()
 
+def verify_audit_trail(audit_trail: List[dict], server_result: dict) -> dict:
+    """
+    Independently verify completed selection results against the public audit trail.
+    Does NOT trust server 'verified' flags or the declared winner.
+    """
+    if not isinstance(audit_trail, list) or len(audit_trail) < 2:
+        return {"verified": False, "checks": {}, "error": "Invalid audit trail: minimum 2 participants required"}
+    if not isinstance(server_result, dict):
+        return {"verified": False, "checks": {}, "error": "Missing or invalid server result"}
+
+    commitments_passed = 0
+    commitments_failed = 0
+    timeouts = 0
+    verified_participants = []
+
+    for p in audit_trail:
+        pid = p.get("id")
+        comm = p.get("commitment")
+        sec = p.get("revealedSecret")
+        is_to = p.get("isTimeout", False)
+
+        if not comm or not HEX_64_REGEX.match(str(comm)):
+            commitments_failed += 1
+            continue
+
+        if is_to or not sec:
+            timeouts += 1
+            continue
+
+        if not HEX_64_REGEX.match(str(sec)):
+            commitments_failed += 1
+            continue
+
+        if verify_commitment(pid, sec, comm):
+            commitments_passed += 1
+            verified_participants.append(p)
+        else:
+            commitments_failed += 1
+
+    commitments_valid = (commitments_failed == 0 and commitments_passed >= 2)
+
+    # If insufficient reveals, protocol must be aborted
+    if len(verified_participants) < 2:
+        is_abort = server_result.get("winner") is None and "aborted" in str(server_result.get("error", "")).lower()
+        return {
+            "verified": is_abort,
+            "isAborted": True,
+            "checks": {
+                "commitments": {"valid": commitments_valid, "passed": commitments_passed, "total": len(audit_trail), "failed": commitments_failed, "timeouts": timeouts},
+                "reveals": {"valid": commitments_failed == 0, "validCount": len(verified_participants), "requiredCount": 2},
+                "entropy": {"valid": True, "computed": None, "expected": None},
+                "selection": {"valid": True, "computedIndex": None, "expectedIndex": None},
+                "winner": {"valid": is_abort, "computedWinner": None, "expectedWinner": None},
+            },
+            "error": None if is_abort else "Insufficient valid reveals to declare a winner"
+        }
+
+    # Reconstruct entropy
+    valid_secrets = [p["revealedSecret"] for p in verified_participants]
+    reconstructed_bytes = combine_randomness(valid_secrets)
+    computed_entropy_hex = reconstructed_bytes.hex()
+    expected_entropy_hex = (server_result.get("combinedRandomness") or "").lower()
+    entropy_valid = (computed_entropy_hex == expected_entropy_hex)
+
+    # Recompute selection
+    selection = unbiased_select(reconstructed_bytes, len(verified_participants))
+    selection_valid = (
+        selection["index"] == server_result.get("selectedIndex") and
+        selection["sampleValue"] == str(server_result.get("sampleValue")) and
+        selection["rejections"] == server_result.get("rejections")
+    )
+
+    # Verify winner
+    calculated_winner = verified_participants[selection["index"]]
+    expected_winner = server_result.get("winner")
+    winner_matches = bool(expected_winner and calculated_winner.get("id") == expected_winner.get("id"))
+
+    all_passed = commitments_valid and entropy_valid and selection_valid and winner_matches
+    failure_reasons = []
+    if not commitments_valid:
+        failure_reasons.append(f"Commitment verification failed ({commitments_failed} invalid)")
+    if not entropy_valid:
+        failure_reasons.append("Combined entropy mismatch")
+    if not selection_valid:
+        failure_reasons.append("Selection calculation mismatch")
+    if not winner_matches:
+        failure_reasons.append(f"Winner mismatch: calculated {calculated_winner.get('id')} but announced {expected_winner.get('id') if expected_winner else None}")
+
+    return {
+        "verified": all_passed,
+        "isAborted": False,
+        "checks": {
+            "commitments": {
+                "valid": commitments_valid,
+                "passed": commitments_passed,
+                "total": len(audit_trail),
+                "failed": commitments_failed,
+                "timeouts": timeouts
+            },
+            "reveals": {
+                "valid": commitments_failed == 0,
+                "validCount": len(verified_participants),
+                "requiredCount": 2
+            },
+            "entropy": {
+                "valid": entropy_valid,
+                "computed": computed_entropy_hex,
+                "expected": expected_entropy_hex
+            },
+            "selection": {
+                "valid": selection_valid,
+                "computedIndex": selection["index"],
+                "expectedIndex": server_result.get("selectedIndex"),
+                "computedSampleValue": selection["sampleValue"],
+                "expectedSampleValue": server_result.get("sampleValue"),
+                "computedRejections": selection["rejections"],
+                "expectedRejections": server_result.get("rejections")
+            },
+            "winner": {
+                "valid": winner_matches,
+                "computedWinner": {"id": calculated_winner.get("id"), "name": calculated_winner.get("name")},
+                "expectedWinner": expected_winner
+            }
+        },
+        "error": None if all_passed else "; ".join(failure_reasons)
+    }
+
 
 # ---------------------------------------------------------------------------
 # Room & Protocol State Manager (Identical to Node protocol.js)

@@ -20,7 +20,7 @@
       <nav class="nav-links">
         <button id="navGameBtn" class="nav-btn active">Protocol Game</button>
         <button id="navFairnessBtn" class="nav-btn">Fairness Simulation</button>
-        <button id="navAttackBtn" class="nav-btn">Attack Sandbox</button>
+        <button id="navAttackBtn" class="nav-btn">Security Lab</button>
       </nav>
     </header>
 
@@ -200,11 +200,24 @@
           <h2 class="winner-title">🎉 WINNER 🎉</h2>
           <div class="winner-name" id="winnerNameDisplay">---</div>
 
-          <div class="winner-checklist">
-            <div class="check-item">✓ All commitments verified</div>
-            <div class="check-item">✓ All reveals verified</div>
-            <div class="check-item">✓ Randomness combined</div>
-            <div class="check-item">✓ Unbiased selection completed</div>
+          <!-- Dynamic Independent Verification Box -->
+          <div id="independentVerificationBox" class="verification-box">
+            <div class="verification-header">
+              <span class="verification-shield">🛡️</span>
+              <div class="verification-titles">
+                <h4>Independent Client Verification</h4>
+                <p class="verification-desc">Cryptographically calculated by browser Web Crypto API without trusting server flags</p>
+              </div>
+              <span id="verificationStatusBadge" class="status-badge waiting">Verifying...</span>
+            </div>
+            <div id="verificationChecklist" class="winner-checklist">
+              <div id="vCheckCommitments" class="check-item pending">⏳ SHA-256 Commitments</div>
+              <div id="vCheckReveals" class="check-item pending">⏳ Reveal Integrity & Formats</div>
+              <div id="vCheckEntropy" class="check-item pending">⏳ Reconstructed Entropy (Bitwise XOR)</div>
+              <div id="vCheckSelection" class="check-item pending">⏳ Recomputed Rejection Sampling (BigInt)</div>
+              <div id="vCheckWinner" class="check-item pending">⏳ Winner Match & Selection Integrity</div>
+            </div>
+            <div id="verificationErrorDetail" class="verification-error-detail hidden"></div>
           </div>
 
           <button id="toggleAuditBtn" class="btn btn-secondary">View Cryptographic Audit Details</button>
@@ -235,10 +248,11 @@
             <table class="protocol-table">
               <thead>
                 <tr>
-                  <th>Name</th>
+                  <th>Participant</th>
                   <th>Commitment Hash</th>
                   <th>Revealed Secret</th>
-                  <th>Status</th>
+                  <th>Client Verification</th>
+                  <th>Server Status</th>
                 </tr>
               </thead>
               <tbody id="auditTableBody"></tbody>
@@ -314,55 +328,217 @@
       </div>
     </section>
 
-    <!-- ATTACK DEMONSTRATION SANDBOX -->
+    <!-- SECURITY LAB VIEW -->
     <section id="attackSection" class="view-section card hidden">
       <div class="section-title">
-        <h2>Cheating Attack & Tamper Detection Sandbox</h2>
-        <p class="subtitle">Demonstrating the preimage resistance and binding properties of SHA-256 commitments</p>
+        <h2>Security Lab & Cryptographic Verification Sandbox</h2>
+        <p class="subtitle">Interactive simulations demonstrating preimage resistance, commitment binding, participant identity binding, and rejection sampling. Fully isolated from live game state.</p>
       </div>
 
-      <div class="sandbox-grid">
-        <div class="sandbox-card">
-          <h3>1. Genuine Secret & Commitment</h3>
-          <p>Participant submits commitment during the Commit Phase:</p>
-          <div class="form-group">
-            <label>Original Secret:</label>
-            <input type="text" id="demoOriginalSecret" value="123456" class="code-input">
+      <!-- Security Lab Navigation Tabs -->
+      <div class="lab-tabs">
+        <button id="labTabSecretBtn" class="lab-tab-btn active" data-tab="labSecret">1. Secret Tampering</button>
+        <button id="labTabCommitmentBtn" class="lab-tab-btn" data-tab="labCommitment">2. Commitment Tampering</button>
+        <button id="labTabIdBtn" class="lab-tab-btn" data-tab="labId">3. Participant-ID Tampering</button>
+        <button id="labTabWinnerBtn" class="lab-tab-btn" data-tab="labWinner">4. Winner Tampering</button>
+        <button id="labTabModuloBtn" class="lab-tab-btn" data-tab="labModulo">5. Modulo Bias Analysis</button>
+      </div>
+
+      <!-- Experiment A: Secret Tampering -->
+      <div id="labSecret" class="lab-pane">
+        <h3>Experiment A: Secret Tampering (Preimage Binding)</h3>
+        <p class="lab-desc">An attacker attempts to alter their revealed secret during the Reveal Phase. The client independently recalculates SHA-256(Participant ID + ":" + Tampered Secret) and compares it with the locked commitment.</p>
+        <div class="sandbox-grid">
+          <div class="sandbox-card">
+            <h4>Genuine Participant & Commitment</h4>
+            <div class="form-group">
+              <label>Participant ID:</label>
+              <input type="text" id="labSecPid" value="usr_alice123" readonly class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Original Secret (256-bit Hex):</label>
+              <input type="text" id="labSecOriginal" value="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Committed Hash:</label>
+              <div class="hash-box" id="labSecOriginalCommit">Calculating...</div>
+            </div>
           </div>
-          <div class="form-group">
-            <label>Computed SHA-256 Commitment:</label>
-            <div class="hash-box" id="demoOriginalCommitment">Calculating...</div>
+          <div class="sandbox-card">
+            <h4>Attacker's Altered Reveal</h4>
+            <div class="form-group">
+              <label>Altered Secret Submitted at Reveal:</label>
+              <input type="text" id="labSecTampered" value="9999994298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Recalculated Commitment Hash:</label>
+              <div class="hash-box" id="labSecTamperedCommit">Calculating...</div>
+            </div>
+            <button id="btnFlipSecretBit" class="btn btn-secondary btn-sm" style="margin-top:0.5rem;">Inject Single-Character Modification</button>
+          </div>
+        </div>
+        <div class="sandbox-action">
+          <button id="btnVerifySecretTamper" class="btn btn-danger btn-large">Execute Client Verifier on Tampered Secret</button>
+        </div>
+        <div id="labSecResult" class="tamper-result hidden"></div>
+      </div>
+
+      <!-- Experiment B: Commitment Tampering -->
+      <div id="labCommitment" class="lab-pane hidden">
+        <h3>Experiment B: Commitment Tampering (Audit Integrity)</h3>
+        <p class="lab-desc">An attacker or malicious server attempts to replace the stored commitment in the audit record while leaving the original secret unchanged.</p>
+        <div class="sandbox-grid">
+          <div class="sandbox-card">
+            <h4>Legitimate Preimage & Secret</h4>
+            <div class="form-group">
+              <label>Participant ID:</label>
+              <input type="text" id="labCommPid" value="usr_bob456" readonly class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Revealed Secret:</label>
+              <input type="text" id="labCommSecret" value="a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0" readonly class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Real Preimage Hash SHA-256(ID:Secret):</label>
+              <div class="hash-box" id="labCommRealHash">Calculating...</div>
+            </div>
+          </div>
+          <div class="sandbox-card">
+            <h4>Tampered Commitment Hash in Audit Log</h4>
+            <div class="form-group">
+              <label>Tampered Stored Commitment:</label>
+              <input type="text" id="labCommTampered" value="0000000000000000000000000000000000000000000000000000000000000000" class="code-input">
+            </div>
+            <button id="btnCorruptCommitment" class="btn btn-secondary btn-sm" style="margin-top:0.5rem;">Alter Commitment Hash</button>
+          </div>
+        </div>
+        <div class="sandbox-action">
+          <button id="btnVerifyCommTamper" class="btn btn-danger btn-large">Execute Client Verifier on Tampered Commitment</button>
+        </div>
+        <div id="labCommResult" class="tamper-result hidden"></div>
+      </div>
+
+      <!-- Experiment C: Participant-ID Tampering -->
+      <div id="labId" class="lab-pane hidden">
+        <h3>Experiment C: Participant-ID Tampering (Identity Binding)</h3>
+        <p class="lab-desc">Demonstrating why the commitment format includes the participant ID: <code>SHA-256(Participant ID + ":" + Secret)</code> prevents commitment-replay attacks across different participant identities.</p>
+        <div class="sandbox-grid">
+          <div class="sandbox-card">
+            <h4>Original Registered Participant</h4>
+            <div class="form-group">
+              <label>Original Participant ID:</label>
+              <input type="text" id="labIdOrigPid" value="usr_charlie789" class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Secret:</label>
+              <input type="text" id="labIdSecret" value="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Original Commitment:</label>
+              <div class="hash-box" id="labIdOrigCommit">Calculating...</div>
+            </div>
+          </div>
+          <div class="sandbox-card">
+            <h4>Replay / Impersonated Identity</h4>
+            <div class="form-group">
+              <label>Impersonated Attacker ID:</label>
+              <input type="text" id="labIdTamperedPid" value="usr_impersonator999" class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Recalculated Commitment for Attacker ID:</label>
+              <div class="hash-box" id="labIdTamperedCommit">Calculating...</div>
+            </div>
+          </div>
+        </div>
+        <div class="sandbox-action">
+          <button id="btnVerifyIdTamper" class="btn btn-danger btn-large">Execute Client Verifier on Swapped Identity</button>
+        </div>
+        <div id="labIdResult" class="tamper-result hidden"></div>
+      </div>
+
+      <!-- Experiment D: Winner Tampering -->
+      <div id="labWinner" class="lab-pane hidden">
+        <h3>Experiment D: Winner Tampering (Selection Verification)</h3>
+        <p class="lab-desc">A dishonest server attempts to declare a favored participant as the winner despite all secrets and commitments being valid. The client independently recomputes rejection sampling and catches the fraud.</p>
+        <div class="sandbox-grid">
+          <div class="sandbox-card">
+            <h4>Cryptographic Input State</h4>
+            <p class="info-text">3 Valid Participants with legitimate reveals. Reconstructed entropy produces a deterministic selection.</p>
+            <div class="audit-stats" style="margin-top:0.75rem;">
+              <div>Calculated Winner: <strong id="labWinLegitWinner" style="color:var(--accent-green)">Loading...</strong></div>
+              <div>Calculated Index: <strong id="labWinLegitIndex">Loading...</strong></div>
+            </div>
+          </div>
+          <div class="sandbox-card">
+            <h4>Fraudulent Server Announcement</h4>
+            <div class="form-group">
+              <label>Fabricated Winner Name / ID:</label>
+              <input type="text" id="labWinTamperedName" value="Attacker (Favored)" class="code-input">
+            </div>
+            <div class="form-group">
+              <label>Fabricated Winner Index:</label>
+              <input type="number" id="labWinTamperedIndex" value="2" min="0" max="2" style="padding:0.5rem;">
+            </div>
+          </div>
+        </div>
+        <div class="sandbox-action">
+          <button id="btnVerifyWinnerTamper" class="btn btn-danger btn-large">Execute Client Verifier on Fabricated Winner</button>
+        </div>
+        <div id="labWinResult" class="tamper-result hidden"></div>
+      </div>
+
+      <!-- Experiment E: Modulo Bias Analysis -->
+      <div id="labModulo" class="lab-pane hidden">
+        <h3>Experiment E: Modulo Bias vs Rejection Sampling</h3>
+        <p class="lab-desc">Explains and empirically demonstrates why naive <code>val % n</code> produces unfair probabilities when the random number space is not divisible by <code>n</code>, and how Fair Pick's rejection sampling achieves uniform fairness.</p>
+        
+        <div class="audit-grid">
+          <div class="audit-card">
+            <h4>Mathematical Cause of Modulo Bias</h4>
+            <p style="font-size:0.88rem; color:var(--text-muted); line-height:1.5;">
+              When generating a random 64-bit integer \(V \in [0, 2^{64}-1]\), the range size is \(2^{64} = 18,446,744,073,709,551,616\).<br>
+              If \(2^{64}\) is not divisible by \(n\) (e.g. for \(n=3, 5, 6, 7, 10\)), the remainder \(2^{64} \pmod n\) leaves the lower buckets with <strong>one extra possibility</strong> than the upper buckets.
+            </p>
+          </div>
+          <div class="audit-card">
+            <h4>Fair Pick Cutoff Formula</h4>
+            <p class="formula">\(L = 2^{64} - (2^{64} \pmod n)\)</p>
+            <p style="font-size:0.88rem; color:var(--text-muted); line-height:1.5;">
+              If \(V < L\), accept \(V \pmod n\).<br>
+              If \(V \ge L\), reject \(V\), re-hash \(V\) via SHA-256, and test the next candidate. This ensures every outcome in \([0, n-1]\) has <strong>identical</strong> probability.
+            </p>
           </div>
         </div>
 
-        <div class="sandbox-card">
-          <h3>2. Attacker Tampered Reveal</h3>
-          <p>Attacker attempts to change their secret during the Reveal Phase:</p>
-          <div class="form-group">
-            <label>Attempted Reveal Secret:</label>
-            <input type="text" id="demoTamperedSecret" value="999999" class="code-input">
+        <div class="form-group" style="max-width:300px; margin: 1rem 0;">
+          <label>Demonstration Domain Size (Small Scale for Direct Empirical Visualization):</label>
+          <select id="labModDomainSelect" class="select-input">
+            <option value="10">Range [0, 9] with n=3 (Remainder: 1 extra in bucket 0)</option>
+            <option value="14">Range [0, 13] with n=4 (Remainder: 2 extra in buckets 0, 1)</option>
+            <option value="11">Range [0, 10] with n=5 (Remainder: 1 extra in bucket 0)</option>
+          </select>
+        </div>
+        <button id="btnRunModuloCompare" class="btn btn-primary">Run Empirical Comparison</button>
+        <p class="info-text" style="margin-top:0.5rem; font-style:italic;">Note: This is an empirical demonstration comparing finite sample distributions; not a substitute for mathematical proofs.</p>
+
+        <div id="labModResults" class="stats-row hidden" style="margin-top:1.5rem;">
+          <div class="stat-card">
+            <span class="stat-label">Naive Modulo Rejection Count</span>
+            <span class="stat-value" id="labModNaiveRejections">0</span>
+            <span style="color:var(--accent-red); font-size:0.8rem; margin-top:0.25rem;">(Accepts biased domain)</span>
           </div>
-          <div class="form-group">
-            <label>Attacker Hash (What server checks):</label>
-            <div class="hash-box" id="demoTamperedCommitment">Calculating...</div>
+          <div class="stat-card">
+            <span class="stat-label">Rejection Sampling Cutoff (L)</span>
+            <span class="stat-value" id="labModLimit">---</span>
+            <span style="color:var(--accent-green); font-size:0.8rem; margin-top:0.25rem;">(Unbiased domain [0, L-1])</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Rejections Triggered (Simulated)</span>
+            <span class="stat-value" id="labModRejectionsTriggered">0</span>
+            <span style="color:var(--accent-cyan); font-size:0.8rem; margin-top:0.25rem;">(Re-hashed candidates)</span>
           </div>
         </div>
-      </div>
-
-      <div class="sandbox-action">
-        <button id="testTamperBtn" class="btn btn-danger btn-large">Verify Tampered Reveal</button>
-      </div>
-
-      <div id="tamperResultBox" class="tamper-result hidden">
-        <div class="alert-box-danger">
-          <h3>❌ ATTACK DETECTED</h3>
-          <p>Commitment verification failed.</p>
-          <p>Reveal rejected.</p>
-          <div class="tamper-details">
-            <div>Expected Commitment: <code id="tamperExpected"></code></div>
-            <div>Stored Commitment: <code id="tamperStored"></code></div>
-          </div>
-        </div>
+        <div id="labModComparisonLog" class="hash-box hidden" style="margin-top:1rem; max-height:180px; overflow-y:auto; font-size:0.8rem;"></div>
       </div>
     </section>
 

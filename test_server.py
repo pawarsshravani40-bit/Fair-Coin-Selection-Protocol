@@ -1,6 +1,8 @@
 import time
 import unittest
 import json
+import hashlib
+import copy
 from starlette.testclient import TestClient
 
 from server import (
@@ -10,6 +12,8 @@ from server import (
     verify_commitment,
     combine_randomness,
     unbiased_select,
+    verify_audit_trail,
+    MAX_UINT64,
     Room,
     RoomManager,
     STATES,
@@ -1694,6 +1698,477 @@ class TestPhase3NativeWebSocketAndSessionRecovery(unittest.TestCase):
             self.assertIn(sec_alice, audit_secrets)
             self.assertIn(sec_bob, audit_secrets)
             self.assertIn(sec_carol, audit_secrets)
+
+
+class TestPhase4IndependentClientVerification(unittest.TestCase):
+    """
+    Phase 4: Independent Client Verification & Security Lab Tests.
+    Verifies that client-side verification logic operates independently without trusting
+    server flags, accurately verifies mathematical commitments, bitwise XOR entropy combination,
+    and BigInt rejection sampling, and rejects all forms of tampering.
+    """
+
+    def _setup_completed_3_player_game(self):
+        """Helper to create and run a 3-player protocol run to COMPLETED."""
+        room = Room("ROOM44", "alice_id", "Alice", 3, reveal_duration_seconds=10.0)
+        room.add_participant("bob_id", "Bob")
+        room.add_participant("carol_id", "Carol")
+        room.start_protocol("alice_id")
+
+        s_alice = generate_secret()
+        s_bob = generate_secret()
+        s_carol = generate_secret()
+
+        room.submit_commitment("alice_id", compute_commitment("alice_id", s_alice))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s_bob))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s_carol))
+
+        room.open_reveal_phase(duration_seconds=10.0)
+        room.submit_reveal("alice_id", s_alice)
+        room.submit_reveal("bob_id", s_bob)
+        room.submit_reveal("carol_id", s_carol)
+
+        return room, (s_alice, s_bob, s_carol)
+
+    def test_01_valid_commitment_independently_verifies(self):
+        """1. Valid commitment independently verifies (SHA-256(pid:secret) matching)."""
+        pid = "participant_alice"
+        secret = generate_secret()
+        expected_hash = hashlib.sha256(f"{pid}:{secret}".encode("utf-8")).hexdigest()
+        server_comm = compute_commitment(pid, secret)
+
+        self.assertEqual(server_comm, expected_hash)
+        self.assertTrue(verify_commitment(pid, secret, server_comm))
+
+    def test_02_altered_secret_fails_commitment_verification(self):
+        """2. Altered secret fails commitment verification."""
+        pid = "alice_id"
+        secret = generate_secret()
+        commitment = compute_commitment(pid, secret)
+
+        # Mutate last character of secret
+        altered_secret = secret[:-1] + ("0" if secret[-1] != "0" else "1")
+        self.assertFalse(verify_commitment(pid, altered_secret, commitment))
+
+        # Test within audit trail verification
+        room, _ = self._setup_completed_3_player_game()
+        tampered_trail = copy.deepcopy(room.result["auditTrail"])
+        tampered_trail[0]["revealedSecret"] = altered_secret
+
+        verification = verify_audit_trail(tampered_trail, room.result)
+        self.assertFalse(verification["verified"])
+        self.assertFalse(verification["checks"]["commitments"]["valid"])
+        self.assertGreaterEqual(verification["checks"]["commitments"]["failed"], 1)
+
+    def test_03_altered_commitment_fails_verification(self):
+        """3. Altered commitment fails verification."""
+        pid = "bob_id"
+        secret = generate_secret()
+        commitment = compute_commitment(pid, secret)
+
+        altered_commitment = commitment[:-1] + ("a" if commitment[-1] != "a" else "b")
+        self.assertFalse(verify_commitment(pid, secret, altered_commitment))
+
+        room, _ = self._setup_completed_3_player_game()
+        tampered_trail = copy.deepcopy(room.result["auditTrail"])
+        tampered_trail[1]["commitment"] = altered_commitment
+
+        verification = verify_audit_trail(tampered_trail, room.result)
+        self.assertFalse(verification["verified"])
+        self.assertFalse(verification["checks"]["commitments"]["valid"])
+
+    def test_04_altered_participant_id_fails_verification(self):
+        """4. Altered participant ID fails verification."""
+        pid = "carol_id"
+        secret = generate_secret()
+        commitment = compute_commitment(pid, secret)
+
+        tampered_pid = "attacker_id"
+        self.assertFalse(verify_commitment(tampered_pid, secret, commitment))
+
+        room, _ = self._setup_completed_3_player_game()
+        tampered_trail = copy.deepcopy(room.result["auditTrail"])
+        tampered_trail[2]["id"] = tampered_pid
+
+        verification = verify_audit_trail(tampered_trail, room.result)
+        self.assertFalse(verification["verified"])
+        self.assertFalse(verification["checks"]["commitments"]["valid"])
+
+    def test_05_altered_winner_fails_final_result_verification(self):
+        """5. Altered winner fails final result verification (tampered index / tampered winner)."""
+        room, _ = self._setup_completed_3_player_game()
+        original_result = room.result
+        audit_trail = original_result["auditTrail"]
+
+        # 1) Clean verification passes
+        clean_verify = verify_audit_trail(audit_trail, original_result)
+        self.assertTrue(clean_verify["verified"])
+        self.assertTrue(clean_verify["checks"]["winner"]["valid"])
+
+        # 2) Tamper winner name and ID
+        tampered_result = copy.deepcopy(original_result)
+        real_winner_id = original_result["winner"]["id"]
+        other_p = next(p for p in audit_trail if p["id"] != real_winner_id)
+        tampered_result["winner"] = {"id": other_p["id"], "name": other_p["name"]}
+
+        verification = verify_audit_trail(audit_trail, tampered_result)
+        self.assertFalse(verification["verified"])
+        self.assertFalse(verification["checks"]["winner"]["valid"])
+        self.assertIn("Winner mismatch", str(verification["error"]))
+
+        # 3) Tamper selectedIndex
+        tampered_idx_result = copy.deepcopy(original_result)
+        tampered_idx_result["selectedIndex"] = (tampered_idx_result["selectedIndex"] + 1) % 3
+        verification2 = verify_audit_trail(audit_trail, tampered_idx_result)
+        self.assertFalse(verification2["verified"])
+        self.assertFalse(verification2["checks"]["selection"]["valid"])
+
+    def test_06_valid_entropy_reconstruction_matches_server_calculation(self):
+        """6. Valid entropy reconstruction matches server calculation (XOR of all revealed secrets)."""
+        s1 = generate_secret()
+        s2 = generate_secret()
+        s3 = generate_secret()
+
+        server_entropy = combine_randomness([s1, s2, s3])
+
+        # Client-side independent bitwise XOR calculation: SHA-256(s1) ^ SHA-256(s2) ^ SHA-256(s3)
+        h1 = hashlib.sha256(s1.encode("utf-8")).digest()
+        h2 = hashlib.sha256(s2.encode("utf-8")).digest()
+        h3 = hashlib.sha256(s3.encode("utf-8")).digest()
+        client_entropy = bytes(x ^ y ^ z for x, y, z in zip(h1, h2, h3))
+
+        self.assertEqual(client_entropy, server_entropy)
+        self.assertEqual(client_entropy.hex(), server_entropy.hex())
+
+    def test_07_valid_rejection_sampling_matches_server_result(self):
+        """7. Valid rejection sampling matches server result (same combined entropy produces exact same winner)."""
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        combined = combine_randomness([s1, s2, s3])
+        n = 3
+
+        # Server selection
+        server_res = unbiased_select(combined, n)
+
+        # Independent client calculation
+        limit = MAX_UINT64 - (MAX_UINT64 % n)
+        curr = combined
+        rejections = 0
+        while True:
+            val = int.from_bytes(curr[:8], "big")
+            if val < limit:
+                idx = val % n
+                break
+            rejections += 1
+            curr = hashlib.sha256(curr).digest()
+
+        self.assertEqual(server_res["index"], idx)
+        self.assertEqual(server_res["sampleValue"], str(val))
+        self.assertEqual(server_res["rejections"], rejections)
+
+    def test_08_rejection_case_handled_correctly(self):
+        """8. Rejection case handled correctly (when counter example or large byte value triggers rejection, loop proceeds correctly)."""
+        n = 3
+        limit = MAX_UINT64 - (MAX_UINT64 % n)
+        # Synthetic seed with first 8 bytes = limit (0xFFFFFFFFFFFFFFFF)
+        # 18446744073709551615 is exactly equal to limit for n=3, so val < limit evaluates to False
+        synthetic_seed = (0xFFFFFFFFFFFFFFFF).to_bytes(8, "big") + bytes(24)
+
+        result = unbiased_select(synthetic_seed, n)
+
+        self.assertGreaterEqual(result["rejections"], 1)
+        self.assertIn(result["index"], range(n))
+        # Ensure independent simulation with the same seed matches
+        curr = synthetic_seed
+        client_rejections = 0
+        while True:
+            val = int.from_bytes(curr[:8], "big")
+            if val < limit:
+                client_idx = val % n
+                break
+            client_rejections += 1
+            curr = hashlib.sha256(curr).digest()
+
+        self.assertEqual(result["index"], client_idx)
+        self.assertEqual(result["rejections"], client_rejections)
+        self.assertEqual(result["sampleValue"], str(val))
+
+    def test_09_secrets_remain_hidden_before_reveal_closed(self):
+        """9. Unrevealed secrets remain None in broadcast before REVEAL_CLOSED (privacy preserved during reveal phase)."""
+        room = Room("ROOM09", "alice_id", "Alice", 3, reveal_duration_seconds=10.0)
+        room.add_participant("bob_id", "Bob")
+        room.add_participant("carol_id", "Carol")
+        room.start_protocol("alice_id")
+
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("alice_id", compute_commitment("alice_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+
+        room.open_reveal_phase(duration_seconds=10.0)
+
+        # Alice reveals her secret
+        room.submit_reveal("alice_id", s1)
+
+        # During REVEAL (before all have revealed or deadline elapsed), public state MUST NOT leak secrets
+        pub = room.get_public_state()
+        self.assertEqual(pub["state"], STATES["REVEAL"])
+        for p in pub["participants"]:
+            self.assertIsNone(p["revealedSecret"], f"Secret leaked early for {p['id']}!")
+        self.assertIsNone(pub["result"])
+
+    def test_10_completed_audit_contains_required_public_verification_data(self):
+        """10. Completed audit trail contains all required public verification data (id, commitment, revealedSecret, status)."""
+        room, secrets_tuple = self._setup_completed_3_player_game()
+        self.assertEqual(room.state, STATES["COMPLETED"])
+
+        res = room.result
+        self.assertIn("combinedRandomness", res)
+        self.assertIn("selectedIndex", res)
+        self.assertIn("sampleValue", res)
+        self.assertIn("rejections", res)
+        self.assertIn("winner", res)
+        self.assertIn("auditTrail", res)
+
+        trail = res["auditTrail"]
+        self.assertEqual(len(trail), 3)
+        for item in trail:
+            self.assertIn("id", item)
+            self.assertIn("name", item)
+            self.assertIn("commitment", item)
+            self.assertIn("revealedSecret", item)
+            self.assertIn("verified", item)
+            self.assertTrue(HEX_64_REGEX.match(item["commitment"]))
+            self.assertTrue(HEX_64_REGEX.match(item["revealedSecret"]))
+
+    def test_11_security_lab_data_isolation(self):
+        """11. Security Lab data isolation: running lab verification does not alter server state or room participants."""
+        room, _ = self._setup_completed_3_player_game()
+
+        orig_state = room.state
+        orig_winner = copy.deepcopy(room.result["winner"])
+        orig_trail = copy.deepcopy(room.result["auditTrail"])
+
+        # Simulate Security Lab clone and mutate
+        lab_vector = {
+            "auditTrail": copy.deepcopy(room.result["auditTrail"]),
+            "serverResult": copy.deepcopy(room.result)
+        }
+        # Security lab mutates clone
+        lab_vector["auditTrail"][0]["revealedSecret"] = "f" * 64
+        lab_vector["serverResult"]["winner"] = {"id": "fake_id", "name": "Fake"}
+
+        lab_verification = verify_audit_trail(lab_vector["auditTrail"], lab_vector["serverResult"])
+        self.assertFalse(lab_verification["verified"])
+
+        # Assert server state and room data are completely unchanged
+        self.assertEqual(room.state, orig_state)
+        self.assertEqual(room.result["winner"], orig_winner)
+        self.assertEqual(room.result["auditTrail"], orig_trail)
+
+    def test_12_session_tokens_never_appear_in_public_audit_data(self):
+        """12. Session tokens never appear in public audit data or broadcast state."""
+        room, _ = self._setup_completed_3_player_game()
+
+        # Collect session tokens from participants
+        tokens = [p.session_token for p in room.participants.values() if p.session_token]
+        self.assertGreater(len(tokens), 0)
+
+        pub_json = json.dumps(room.get_public_state())
+        result_json = json.dumps(room.result)
+
+        for token in tokens:
+            self.assertNotIn(token, pub_json)
+            self.assertNotIn(token, result_json)
+
+    def test_13_failed_verification_never_reports_success(self):
+        """13. Failed verification never reports success (tampered state returns valid=False)."""
+        room, _ = self._setup_completed_3_player_game()
+        trail = room.result["auditTrail"]
+        res = room.result
+
+        def corrupt_pop(t, r):
+            t.pop()
+            t.pop()
+
+        corruptions = [
+            # 1. Invalid secret length
+            (lambda t, r: t[0].__setitem__("revealedSecret", "short"), "Invalid secret format"),
+            # 2. Tampered commitment
+            (lambda t, r: t[0].__setitem__("commitment", "0" * 64), "Commitment mismatch"),
+            # 3. Tampered combined entropy
+            (lambda t, r: r.__setitem__("combinedRandomness", "1" * 64), "Entropy mismatch"),
+            # 4. Tampered winner
+            (lambda t, r: r.__setitem__("winner", {"id": "nobody", "name": "Nobody"}), "Winner mismatch"),
+            # 5. Invalid participant count
+            (corrupt_pop, "Invalid audit trail"),
+        ]
+
+        for corrupt_fn, desc in corruptions:
+            t_copy = copy.deepcopy(trail)
+            r_copy = copy.deepcopy(res)
+            corrupt_fn(t_copy, r_copy)
+            out = verify_audit_trail(t_copy, r_copy)
+            self.assertFalse(out["verified"], f"Failed test case '{desc}' unexpectedly passed verification!")
+
+    def test_14_complete_valid_3_player_game_independently_verifies(self):
+        """14. Complete valid 3-player game: all 3 independent verifications succeed, combined entropy matches, winner matches, audit trail is complete."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_alice, \
+             client.websocket_connect("/ws") as ws_bob, \
+             client.websocket_connect("/ws") as ws_carol:
+
+            # 1. Alice creates room
+            ws_alice.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "req_create",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res_create = json.loads(ws_alice.receive_text())
+            self.assertTrue(res_create["success"])
+            room_code = res_create["data"]["room"]["code"]
+            alice_id = res_create["data"]["participantId"]
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+
+            # 2. Bob joins room
+            ws_bob.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "req_join_bob",
+                "payload": {"code": room_code, "name": "Bob"}
+            }))
+            res_bob = json.loads(ws_bob.receive_text())
+            self.assertTrue(res_bob["success"])
+            bob_id = res_bob["data"]["participantId"]
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+
+            # 3. Carol joins room
+            ws_carol.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "req_join_carol",
+                "payload": {"code": room_code, "name": "Carol"}
+            }))
+            res_carol = json.loads(ws_carol.receive_text())
+            self.assertTrue(res_carol["success"])
+            carol_id = res_carol["data"]["participantId"]
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+
+            # 4. Alice starts protocol
+            ws_alice.send_text(json.dumps({
+                "type": "start_protocol",
+                "requestId": "req_start",
+                "payload": {}
+            }))
+            _ = json.loads(ws_alice.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # protocol_started
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # protocol_started
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # protocol_started
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # 5. Commit phase: Generate secrets and commitments
+            sec_alice = generate_secret()
+            sec_bob = generate_secret()
+            sec_carol = generate_secret()
+
+            comm_alice = compute_commitment(alice_id, sec_alice)
+            comm_bob = compute_commitment(bob_id, sec_bob)
+            comm_carol = compute_commitment(carol_id, sec_carol)
+
+            # Alice commits
+            ws_alice.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_alice",
+                "payload": {"commitment": comm_alice}
+            }))
+            _ = json.loads(ws_alice.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # Bob commits
+            ws_bob.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_bob",
+                "payload": {"commitment": comm_bob}
+            }))
+            _ = json.loads(ws_bob.receive_text())    # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # Carol commits -> Commitments locked -> Reveal phase opened
+            ws_carol.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_carol",
+                "payload": {"commitment": comm_carol}
+            }))
+            _ = json.loads(ws_carol.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # commitments_locked
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # commitments_locked
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # commitments_locked
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # 6. Reveal phase
+            ws_alice.send_text(json.dumps({
+                "type": "submit_reveal",
+                "requestId": "rev_alice",
+                "payload": {"secret": sec_alice}
+            }))
+            _ = json.loads(ws_alice.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            ws_bob.send_text(json.dumps({
+                "type": "submit_reveal",
+                "requestId": "rev_bob",
+                "payload": {"secret": sec_bob}
+            }))
+            _ = json.loads(ws_bob.receive_text())    # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            ws_carol.send_text(json.dumps({
+                "type": "submit_reveal",
+                "requestId": "rev_carol",
+                "payload": {"secret": sec_carol}
+            }))
+            _ = json.loads(ws_carol.receive_text())  # ack
+
+            # Winner announcement broadcasts
+            ev_a = json.loads(ws_alice.receive_text())
+            ev_b = json.loads(ws_bob.receive_text())
+            ev_c = json.loads(ws_carol.receive_text())
+
+            self.assertEqual(ev_a["event"], "winner_announced")
+            self.assertEqual(ev_b["event"], "winner_announced")
+            self.assertEqual(ev_c["event"], "winner_announced")
+
+            result_data = ev_a["data"]["result"]
+            audit_trail = result_data["auditTrail"]
+
+            # Independent verification executed on the broadcast data
+            client_verification = verify_audit_trail(audit_trail, result_data)
+
+            self.assertTrue(client_verification["verified"])
+            self.assertTrue(client_verification["checks"]["commitments"]["valid"])
+            self.assertEqual(client_verification["checks"]["commitments"]["passed"], 3)
+            self.assertEqual(client_verification["checks"]["commitments"]["failed"], 0)
+            self.assertTrue(client_verification["checks"]["reveals"]["valid"])
+            self.assertTrue(client_verification["checks"]["entropy"]["valid"])
+            self.assertTrue(client_verification["checks"]["selection"]["valid"])
+            self.assertTrue(client_verification["checks"]["winner"]["valid"])
+            self.assertIn(client_verification["checks"]["winner"]["computedWinner"]["name"], ["Alice", "Bob", "Carol"])
+            self.assertEqual(
+                client_verification["checks"]["winner"]["computedWinner"]["id"],
+                result_data["winner"]["id"]
+            )
 
 
 if __name__ == "__main__":

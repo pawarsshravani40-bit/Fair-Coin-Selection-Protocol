@@ -784,6 +784,131 @@ select:focus {
   display: none !important;
 }
 
+/* Verification Box & Security Lab Styles */
+.verification-box {
+  background: #0d1117;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin: 1.5rem 0;
+  text-align: left;
+}
+
+.verification-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0.75rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.verification-shield {
+  font-size: 1.75rem;
+}
+
+.verification-titles {
+  flex: 1;
+}
+
+.verification-titles h4 {
+  margin: 0;
+  font-size: 1.1rem;
+  color: var(--text-main);
+}
+
+.verification-desc {
+  margin: 0.2rem 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.check-item {
+  font-weight: 500;
+  font-size: 0.9rem;
+  padding: 0.25rem 0;
+}
+
+.check-item.passed {
+  color: var(--accent-green);
+}
+
+.check-item.failed {
+  color: var(--accent-red);
+}
+
+.check-item.pending {
+  color: var(--accent-amber);
+}
+
+.verification-error-detail {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  background: rgba(248, 81, 73, 0.15);
+  border: 1px solid var(--accent-red);
+  border-radius: var(--radius);
+  color: var(--accent-red);
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+/* Security Lab Tabs & Panels */
+.lab-tabs {
+  display: flex;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.lab-tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.6rem 1rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: all 0.2s;
+}
+
+.lab-tab-btn:hover {
+  color: var(--text-main);
+}
+
+.lab-tab-btn.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
+}
+
+.lab-pane {
+  display: flex;
+  flex-direction: column;
+}
+
+.lab-desc {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 1.25rem;
+  line-height: 1.5;
+}
+
+.alert-box-success {
+  background-color: rgba(35, 134, 54, 0.15);
+  border: 2px solid var(--accent-green);
+  color: var(--accent-green);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.alert-box-success h3 {
+  font-size: 1.5rem;
+  margin-bottom: 0.5rem;
+}
+
 /* Footer */
 .app-footer {
   text-align: center;

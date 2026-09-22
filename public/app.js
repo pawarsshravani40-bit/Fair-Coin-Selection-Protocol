@@ -207,6 +207,371 @@ async function computeClientCommitment(participantId, secret) {
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * Independently verifies the completed selection result against the public audit trail.
+ * Does NOT trust any server-provided 'verified' flags or the declared winner.
+ * Recomputes SHA-256 commitments, bitwise XOR entropy combination, and
+ * rejection sampling from scratch using the Web Crypto API and BigInt arithmetic.
+ *
+ * @param {Array<Object>} auditTrail - Array of participant audit records
+ * @param {Object} serverResult - The server's declared result object
+ * @returns {Promise<Object>} Verification report with granular check results
+ */
+async function verifyAuditTrail(auditTrail, serverResult) {
+  const HEX_64_REGEX = /^[0-9a-fA-F]{64}$/;
+
+  if (!Array.isArray(auditTrail) || auditTrail.length < 2) {
+    return {
+      verified: false,
+      checks: {},
+      error: 'Invalid audit trail: minimum 2 participants required'
+    };
+  }
+  if (!serverResult || typeof serverResult !== 'object') {
+    return {
+      verified: false,
+      checks: {},
+      error: 'Missing or invalid server result'
+    };
+  }
+
+  let commitmentsPassed = 0;
+  let commitmentsFailed = 0;
+  let timeoutCount = 0;
+  const participantVerifications = [];
+  const verifiedParticipants = [];
+
+  for (const p of auditTrail) {
+    const pid = String(p.id || '');
+    const comm = String(p.commitment || '');
+    const sec = p.revealedSecret ? String(p.revealedSecret) : null;
+    const isTimeout = Boolean(p.isTimeout);
+
+    // 1. Commitment format validation
+    if (!comm || !HEX_64_REGEX.test(comm)) {
+      commitmentsFailed++;
+      participantVerifications.push({
+        id: pid,
+        name: p.name,
+        verified: false,
+        reason: 'Invalid commitment format (must be 64 hex characters)'
+      });
+      continue;
+    }
+
+    // 2. Timeout / non-reveal handling
+    if (isTimeout || !sec) {
+      timeoutCount++;
+      participantVerifications.push({
+        id: pid,
+        name: p.name,
+        verified: false,
+        reason: 'Participant timed out or did not reveal secret'
+      });
+      continue;
+    }
+
+    // 3. Secret format validation
+    if (!HEX_64_REGEX.test(sec)) {
+      commitmentsFailed++;
+      participantVerifications.push({
+        id: pid,
+        name: p.name,
+        verified: false,
+        reason: 'Invalid revealed secret format (must be 64 hex characters)'
+      });
+      continue;
+    }
+
+    // 4. Cryptographic commitment verification: SHA-256(participantId + ":" + secret)
+    const computedHash = await computeClientCommitment(pid, sec);
+    if (computedHash.toLowerCase() === comm.toLowerCase()) {
+      commitmentsPassed++;
+      participantVerifications.push({
+        id: pid,
+        name: p.name,
+        verified: true,
+        computedCommitment: computedHash
+      });
+      verifiedParticipants.push({
+        id: pid,
+        name: p.name,
+        secret: sec
+      });
+    } else {
+      commitmentsFailed++;
+      participantVerifications.push({
+        id: pid,
+        name: p.name,
+        verified: false,
+        reason: 'Commitment mismatch: preimage hash differs from locked commitment',
+        computedCommitment: computedHash,
+        storedCommitment: comm
+      });
+    }
+  }
+
+  const commitmentsValid = (commitmentsFailed === 0 && commitmentsPassed >= 2);
+
+  // If fewer than 2 valid reveals, protocol must safely abort
+  if (verifiedParticipants.length < 2) {
+    const isAborted = (serverResult.winner === null || serverResult.winner === undefined) &&
+      String(serverResult.error || '').toLowerCase().includes('aborted');
+    return {
+      verified: isAborted,
+      isAborted: true,
+      participantVerifications,
+      checks: {
+        commitments: {
+          valid: commitmentsValid,
+          passed: commitmentsPassed,
+          total: auditTrail.length,
+          failed: commitmentsFailed,
+          timeouts: timeoutCount
+        },
+        reveals: {
+          valid: commitmentsFailed === 0,
+          validCount: verifiedParticipants.length,
+          requiredCount: 2
+        },
+        entropy: { valid: true, computed: null, expected: null },
+        selection: { valid: true, computedIndex: null, expectedIndex: null },
+        winner: { valid: isAborted, computedWinner: null, expectedWinner: null }
+      },
+      error: isAborted ? null : 'Insufficient valid reveals (minimum 2 required) but protocol was not marked aborted'
+    };
+  }
+
+  // 5. Entropy Reconstruction: SHA-256(S1) ^ SHA-256(S2) ^ ...
+  const enc = new TextEncoder();
+  const combined = new Uint8Array(32);
+
+  for (const p of verifiedParticipants) {
+    const sBytes = enc.encode(p.secret);
+    const digest = await window.crypto.subtle.digest('SHA-256', sBytes);
+    const digestArray = new Uint8Array(digest);
+    for (let i = 0; i < 32; i++) {
+      combined[i] ^= digestArray[i];
+    }
+  }
+
+  const computedEntropyHex = Array.from(combined)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  const expectedEntropyHex = String(serverResult.combinedRandomness || '').toLowerCase();
+  const entropyValid = (computedEntropyHex === expectedEntropyHex);
+
+  // 6. Rejection Sampling using BigInt
+  const MAX_UINT64 = 18446744073709551616n; // 2^64
+  const n = BigInt(verifiedParticipants.length);
+  const limit = MAX_UINT64 - (MAX_UINT64 % n);
+  let curr = new Uint8Array(combined);
+  let rejections = 0;
+  let selectedIndex = -1;
+  let sampleValueStr = '';
+
+  while (true) {
+    let val = 0n;
+    for (let i = 0; i < 8; i++) {
+      val = (val << 8n) | BigInt(curr[i]);
+    }
+    if (val < limit) {
+      selectedIndex = Number(val % n);
+      sampleValueStr = val.toString();
+      break;
+    }
+    rejections++;
+    const nextDigest = await window.crypto.subtle.digest('SHA-256', curr);
+    curr = new Uint8Array(nextDigest);
+  }
+
+  const selectionValid = (
+    selectedIndex === serverResult.selectedIndex &&
+    sampleValueStr === String(serverResult.sampleValue) &&
+    rejections === serverResult.rejections
+  );
+
+  // 7. Winner Validation
+  const calculatedWinner = verifiedParticipants[selectedIndex];
+  const expectedWinner = serverResult.winner;
+  const winnerMatches = Boolean(
+    expectedWinner &&
+    calculatedWinner &&
+    calculatedWinner.id === expectedWinner.id
+  );
+
+  const allPassed = commitmentsValid && entropyValid && selectionValid && winnerMatches;
+  const failureReasons = [];
+  if (!commitmentsValid) {
+    failureReasons.push(`Commitment verification failed (${commitmentsFailed} invalid reveals)`);
+  }
+  if (!entropyValid) {
+    failureReasons.push('Combined entropy mismatch (locally computed bitwise XOR differs from server declaration)');
+  }
+  if (!selectionValid) {
+    failureReasons.push(`Selection calculation mismatch (computed index ${selectedIndex} with ${rejections} rejections vs server index ${serverResult.selectedIndex} with ${serverResult.rejections} rejections)`);
+  }
+  if (!winnerMatches) {
+    failureReasons.push(`Winner identity mismatch: independently calculated winner ${calculatedWinner ? calculatedWinner.name : 'Unknown'} (${calculatedWinner ? calculatedWinner.id : ''}) differs from announced winner ${expectedWinner ? expectedWinner.name : 'None'} (${expectedWinner ? expectedWinner.id : ''})`);
+  }
+
+  return {
+    verified: allPassed,
+    isAborted: false,
+    participantVerifications,
+    checks: {
+      commitments: {
+        valid: commitmentsValid,
+        passed: commitmentsPassed,
+        total: auditTrail.length,
+        failed: commitmentsFailed,
+        timeouts: timeoutCount
+      },
+      reveals: {
+        valid: commitmentsFailed === 0,
+        validCount: verifiedParticipants.length,
+        requiredCount: 2
+      },
+      entropy: {
+        valid: entropyValid,
+        computed: computedEntropyHex,
+        expected: expectedEntropyHex
+      },
+      selection: {
+        valid: selectionValid,
+        computedIndex: selectedIndex,
+        expectedIndex: serverResult.selectedIndex,
+        computedSampleValue: sampleValueStr,
+        expectedSampleValue: serverResult.sampleValue,
+        computedRejections: rejections,
+        expectedRejections: serverResult.rejections
+      },
+      winner: {
+        valid: winnerMatches,
+        computedWinner: calculatedWinner ? { id: calculatedWinner.id, name: calculatedWinner.name } : null,
+        expectedWinner: expectedWinner
+      }
+    },
+    error: allPassed ? null : failureReasons.join('; ')
+  };
+}
+
+/**
+ * Runs independent client verification on the finalized game result
+ * and updates the verification UI elements accordingly.
+ */
+async function runIndependentVerification(result) {
+  if (!result || !result.auditTrail) return;
+
+  const box = document.getElementById('independentVerificationBox');
+  const badge = document.getElementById('verificationStatusBadge');
+  const errBox = document.getElementById('verificationErrorDetail');
+  const checkComm = document.getElementById('vCheckCommitments');
+  const checkRev = document.getElementById('vCheckReveals');
+  const checkEnt = document.getElementById('vCheckEntropy');
+  const checkSel = document.getElementById('vCheckSelection');
+  const checkWin = document.getElementById('vCheckWinner');
+
+  if (box) box.classList.remove('hidden');
+
+  try {
+    const report = await verifyAuditTrail(result.auditTrail, result);
+
+    if (report.verified) {
+      if (badge) {
+        badge.className = 'status-badge verified';
+        badge.textContent = '✓ VERIFIED BY BROWSER';
+      }
+      if (checkComm) {
+        checkComm.className = 'check-item passed';
+        checkComm.textContent = `✓ Commitments Verified (${report.checks.commitments.passed}/${report.checks.commitments.total} SHA-256 preimages valid)`;
+      }
+      if (checkRev) {
+        checkRev.className = 'check-item passed';
+        checkRev.textContent = `✓ Reveal Integrity Verified (All ${report.checks.reveals.validCount} reveals bound to commitments)`;
+      }
+      if (checkEnt) {
+        checkEnt.className = 'check-item passed';
+        checkEnt.textContent = '✓ Entropy Reconstruction Verified (Bitwise XOR matches)';
+      }
+      if (checkSel) {
+        checkSel.className = 'check-item passed';
+        checkSel.textContent = `✓ Rejection Sampling Verified (Zero-bias sampling index ${report.checks.selection.computedIndex}, ${report.checks.selection.computedRejections} rejections)`;
+      }
+      if (checkWin) {
+        checkWin.className = 'check-item passed';
+        checkWin.textContent = `✓ Winner Match Confirmed (${report.checks.winner.computedWinner ? report.checks.winner.computedWinner.name : 'Aborted safely'})`;
+      }
+      if (errBox) errBox.classList.add('hidden');
+    } else {
+      if (badge) {
+        badge.className = 'status-badge attack';
+        badge.textContent = '⚠ VERIFICATION FAILED';
+      }
+      if (checkComm) {
+        checkComm.className = report.checks.commitments?.valid ? 'check-item passed' : 'check-item failed';
+        checkComm.textContent = report.checks.commitments?.valid
+          ? `✓ Commitments Verified (${report.checks.commitments.passed}/${report.checks.commitments.total})`
+          : `❌ Commitment Mismatch (${report.checks.commitments?.failed || 0} failed)`;
+      }
+      if (checkRev) {
+        checkRev.className = report.checks.reveals?.valid ? 'check-item passed' : 'check-item failed';
+        checkRev.textContent = report.checks.reveals?.valid ? '✓ Reveal Integrity Verified' : '❌ Corrupted Reveal Detected';
+      }
+      if (checkEnt) {
+        checkEnt.className = report.checks.entropy?.valid ? 'check-item passed' : 'check-item failed';
+        checkEnt.textContent = report.checks.entropy?.valid ? '✓ Entropy Reconstructed' : '❌ Entropy Mismatch';
+      }
+      if (checkSel) {
+        checkSel.className = report.checks.selection?.valid ? 'check-item passed' : 'check-item failed';
+        checkSel.textContent = report.checks.selection?.valid ? '✓ Selection Verified' : '❌ Selection Calculation Discrepancy';
+      }
+      if (checkWin) {
+        checkWin.className = report.checks.winner?.valid ? 'check-item passed' : 'check-item failed';
+        checkWin.textContent = report.checks.winner?.valid ? '✓ Winner Matches' : '❌ Fraudulent Winner Declared';
+      }
+      if (errBox) {
+        errBox.textContent = `⚠ Verification Failed: ${report.error || 'Cryptographic mismatch detected'}`;
+        errBox.classList.remove('hidden');
+      }
+    }
+
+    // Populate Audit Table with local verification column
+    const auditTbody = document.getElementById('auditTableBody');
+    if (auditTbody && report.participantVerifications) {
+      auditTbody.innerHTML = '';
+      report.participantVerifications.forEach((pv, idx) => {
+        const item = result.auditTrail[idx] || {};
+        const tr = document.createElement('tr');
+        const vBadge = pv.verified
+          ? '<span class="status-badge verified">✓ Verified locally</span>'
+          : `<span class="status-badge attack">❌ ${escapeHtml(pv.reason || 'Failed')}</span>`;
+        const sBadge = item.verified
+          ? '<span class="status-badge verified">Server: Verified</span>'
+          : '<span class="status-badge attack">Server: Rejected</span>';
+
+        tr.innerHTML = `
+          <td><strong>${escapeHtml(pv.name || item.name || pv.id)}</strong></td>
+          <td><span class="hash-box" style="margin:0; padding:0.2rem; font-size:0.75rem;">${item.commitment || '—'}</span></td>
+          <td><span class="hash-box" style="margin:0; padding:0.2rem; font-size:0.75rem;">${item.revealedSecret || '—'}</span></td>
+          <td>${vBadge}</td>
+          <td>${sBadge}</td>
+        `;
+        auditTbody.appendChild(tr);
+      });
+    }
+  } catch (err) {
+    if (badge) {
+      badge.className = 'status-badge attack';
+      badge.textContent = '⚠ ERROR';
+    }
+    if (errBox) {
+      errBox.textContent = `Verification execution error: ${err.message}`;
+      errBox.classList.remove('hidden');
+    }
+  }
+}
+
 // DOM Elements
 const views = {
   home: document.getElementById('homeView'),
@@ -702,19 +1067,9 @@ function updateProtocolUI(room) {
       document.getElementById('auditIndex').textContent = `${room.result.selectedIndex} (${room.result.winner.name})`;
     }
 
-      // Populate Audit Table
-      const auditTbody = document.getElementById('auditTableBody');
-      auditTbody.innerHTML = '';
-      room.result.auditTrail.forEach((item) => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td><strong>${escapeHtml(item.name)}</strong></td>
-          <td><span class="hash-box" style="margin:0; padding:0.2rem; font-size:0.75rem;">${item.commitment || '—'}</span></td>
-          <td><span class="hash-box" style="margin:0; padding:0.2rem; font-size:0.75rem;">${item.revealedSecret || '—'}</span></td>
-          <td>${item.verified ? '<span class="status-badge verified">✓ Verified</span>' : '<span class="status-badge attack">❌ Rejected</span>'}</td>
-        `;
-        auditTbody.appendChild(tr);
-      });
+    // Trigger independent client-side verification
+    if (room.result) {
+      runIndependentVerification(room.result);
     }
   }
 }
@@ -774,33 +1129,386 @@ runSimBtn.addEventListener('click', async () => {
   }
 });
 
-// ATTACK SANDBOX LOGIC
-async function updateAttackSandboxHashes() {
-  const origSecret = document.getElementById('demoOriginalSecret').value;
-  const tampSecret = document.getElementById('demoTamperedSecret').value;
+// ===========================================================================
+// SECURITY LAB LOGIC (ISOLATED CLIENT EXPERIMENTS)
+// ===========================================================================
 
-  const origCommit = await computeClientCommitment('attacker-id', origSecret);
-  const tampCommit = await computeClientCommitment('attacker-id', tampSecret);
+// Security Lab Tab Switching
+const labTabBtns = document.querySelectorAll('.lab-tab-btn');
+const labPanes = document.querySelectorAll('.lab-pane');
 
-  document.getElementById('demoOriginalCommitment').textContent = origCommit;
-  document.getElementById('demoTamperedCommitment').textContent = tampCommit;
+labTabBtns.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    labTabBtns.forEach((b) => b.classList.remove('active'));
+    labPanes.forEach((p) => p.classList.add('hidden'));
+    btn.classList.add('active');
+    const targetId = btn.getAttribute('data-tab');
+    const pane = document.getElementById(targetId);
+    if (pane) pane.classList.remove('hidden');
+    refreshSecurityLabPreviews();
+  });
+});
+
+/**
+ * Returns an isolated test vector for Security Lab experiments.
+ * Never references or mutates state.roomData.
+ */
+async function getBaseLabTestVector() {
+  const p1 = {
+    id: 'usr_alice123',
+    name: 'Alice',
+    secret: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+  };
+  const p2 = {
+    id: 'usr_bob456',
+    name: 'Bob',
+    secret: 'a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0'
+  };
+  const p3 = {
+    id: 'usr_charlie789',
+    name: 'Charlie',
+    secret: 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+  };
+
+  const comm1 = await computeClientCommitment(p1.id, p1.secret);
+  const comm2 = await computeClientCommitment(p2.id, p2.secret);
+  const comm3 = await computeClientCommitment(p3.id, p3.secret);
+
+  const enc = new TextEncoder();
+  const d1 = new Uint8Array(await window.crypto.subtle.digest('SHA-256', enc.encode(p1.secret)));
+  const d2 = new Uint8Array(await window.crypto.subtle.digest('SHA-256', enc.encode(p2.secret)));
+  const d3 = new Uint8Array(await window.crypto.subtle.digest('SHA-256', enc.encode(p3.secret)));
+
+  const combined = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) combined[i] = d1[i] ^ d2[i] ^ d3[i];
+
+  const combHex = Array.from(combined).map((b) => b.toString(16).padStart(2, '0')).join('');
+
+  const MAX_UINT64 = 18446744073709551616n;
+  const n = 3n;
+  const limit = MAX_UINT64 - (MAX_UINT64 % n);
+  let curr = new Uint8Array(combined);
+  let rejections = 0;
+  let selectedIndex = 0;
+  let sampleValue = '0';
+
+  while (true) {
+    let val = 0n;
+    for (let i = 0; i < 8; i++) val = (val << 8n) | BigInt(curr[i]);
+    if (val < limit) {
+      selectedIndex = Number(val % n);
+      sampleValue = val.toString();
+      break;
+    }
+    rejections++;
+    curr = new Uint8Array(await window.crypto.subtle.digest('SHA-256', curr));
+  }
+
+  const participants = [
+    { id: p1.id, name: p1.name, commitment: comm1, revealedSecret: p1.secret, verified: true, isTimeout: false, isAttacking: false },
+    { id: p2.id, name: p2.name, commitment: comm2, revealedSecret: p2.secret, verified: true, isTimeout: false, isAttacking: false },
+    { id: p3.id, name: p3.name, commitment: comm3, revealedSecret: p3.secret, verified: true, isTimeout: false, isAttacking: false }
+  ];
+
+  const winner = participants[selectedIndex];
+
+  return {
+    combinedRandomness: combHex,
+    selectedIndex: selectedIndex,
+    sampleValue: sampleValue,
+    rejections: rejections,
+    verifiedCount: 3,
+    totalCount: 3,
+    winner: { id: winner.id, name: winner.name },
+    auditTrail: participants
+  };
 }
 
-document.getElementById('demoOriginalSecret').addEventListener('input', updateAttackSandboxHashes);
-document.getElementById('demoTamperedSecret').addEventListener('input', updateAttackSandboxHashes);
+async function refreshSecurityLabPreviews() {
+  const vector = await getBaseLabTestVector();
 
-document.getElementById('testTamperBtn').addEventListener('click', async () => {
-  const origSecret = document.getElementById('demoOriginalSecret').value;
-  const tampSecret = document.getElementById('demoTamperedSecret').value;
+  // Exp A previews
+  const labSecPid = document.getElementById('labSecPid');
+  const labSecOriginal = document.getElementById('labSecOriginal');
+  const labSecTampered = document.getElementById('labSecTampered');
+  const labSecOriginalCommit = document.getElementById('labSecOriginalCommit');
+  const labSecTamperedCommit = document.getElementById('labSecTamperedCommit');
 
-  const origCommit = await computeClientCommitment('attacker-id', origSecret);
-  const tampCommit = await computeClientCommitment('attacker-id', tampSecret);
+  if (labSecPid && labSecOriginal && labSecOriginalCommit) {
+    const origHash = await computeClientCommitment(labSecPid.value, labSecOriginal.value);
+    labSecOriginalCommit.textContent = origHash;
+  }
+  if (labSecPid && labSecTampered && labSecTamperedCommit) {
+    const tampHash = await computeClientCommitment(labSecPid.value, labSecTampered.value);
+    labSecTamperedCommit.textContent = tampHash;
+  }
 
-  const resultBox = document.getElementById('tamperResultBox');
-  document.getElementById('tamperExpected').textContent = origCommit;
-  document.getElementById('tamperStored').textContent = tampCommit;
-  resultBox.classList.remove('hidden');
-});
+  // Exp B previews
+  const labCommPid = document.getElementById('labCommPid');
+  const labCommSecret = document.getElementById('labCommSecret');
+  const labCommRealHash = document.getElementById('labCommRealHash');
+  if (labCommPid && labCommSecret && labCommRealHash) {
+    const realHash = await computeClientCommitment(labCommPid.value, labCommSecret.value);
+    labCommRealHash.textContent = realHash;
+  }
+
+  // Exp C previews
+  const labIdOrigPid = document.getElementById('labIdOrigPid');
+  const labIdTamperedPid = document.getElementById('labIdTamperedPid');
+  const labIdSecret = document.getElementById('labIdSecret');
+  const labIdOrigCommit = document.getElementById('labIdOrigCommit');
+  const labIdTamperedCommit = document.getElementById('labIdTamperedCommit');
+  if (labIdOrigPid && labIdSecret && labIdOrigCommit) {
+    const origCommit = await computeClientCommitment(labIdOrigPid.value, labIdSecret.value);
+    labIdOrigCommit.textContent = origCommit;
+  }
+  if (labIdTamperedPid && labIdSecret && labIdTamperedCommit) {
+    const tampCommit = await computeClientCommitment(labIdTamperedPid.value, labIdSecret.value);
+    labIdTamperedCommit.textContent = tampCommit;
+  }
+
+  // Exp D previews
+  const legitWinnerEl = document.getElementById('labWinLegitWinner');
+  const legitIndexEl = document.getElementById('labWinLegitIndex');
+  if (legitWinnerEl && legitIndexEl) {
+    legitWinnerEl.textContent = `${vector.winner.name} (${vector.winner.id})`;
+    legitIndexEl.textContent = `${vector.selectedIndex}`;
+  }
+}
+
+// Exp A: Secret Tampering Handlers
+const labSecOriginalInput = document.getElementById('labSecOriginal');
+const labSecTamperedInput = document.getElementById('labSecTampered');
+if (labSecOriginalInput) labSecOriginalInput.addEventListener('input', refreshSecurityLabPreviews);
+if (labSecTamperedInput) labSecTamperedInput.addEventListener('input', refreshSecurityLabPreviews);
+
+const btnFlipSecretBit = document.getElementById('btnFlipSecretBit');
+if (btnFlipSecretBit) {
+  btnFlipSecretBit.addEventListener('click', () => {
+    const inp = document.getElementById('labSecTampered');
+    if (inp) {
+      const cur = inp.value;
+      inp.value = cur.startsWith('9') ? '8' + cur.slice(1) : '9' + cur.slice(1);
+      refreshSecurityLabPreviews();
+    }
+  });
+}
+
+const btnVerifySecretTamper = document.getElementById('btnVerifySecretTamper');
+if (btnVerifySecretTamper) {
+  btnVerifySecretTamper.addEventListener('click', async () => {
+    const vector = await getBaseLabTestVector();
+    const pid = document.getElementById('labSecPid').value;
+    const tamperedSec = document.getElementById('labSecTampered').value;
+
+    vector.auditTrail[0].revealedSecret = tamperedSec;
+    const report = await verifyAuditTrail(vector.auditTrail, vector);
+
+    const resBox = document.getElementById('labSecResult');
+    if (resBox) {
+      resBox.classList.remove('hidden');
+      const origCommit = await computeClientCommitment(pid, document.getElementById('labSecOriginal').value);
+      const tampCommit = await computeClientCommitment(pid, tamperedSec);
+
+      if (!report.verified) {
+        resBox.innerHTML = `
+          <div class="alert-box-danger">
+            <h3>❌ ATTACK DETECTED / VERIFICATION FAILED</h3>
+            <p><strong>Independent Verification Result:</strong> Commitment check failed.</p>
+            <p>${escapeHtml(report.error || 'Preimage does not match stored hash')}</p>
+            <div class="tamper-details">
+              <div>Participant ID: <code>${escapeHtml(pid)}</code></div>
+              <div>Expected Commitment: <code>${escapeHtml(origCommit)}</code></div>
+              <div>Computed from Tampered Secret: <code>${escapeHtml(tampCommit)}</code></div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: Preimage resistance ensures an attacker cannot change their secret after commitments are locked.</div>
+            </div>
+          </div>
+        `;
+      } else {
+        resBox.innerHTML = `<div class="alert-box-success"><h3>✓ Verification Passed</h3></div>`;
+      }
+    }
+  });
+}
+
+// Exp B: Commitment Tampering Handlers
+const btnCorruptCommitment = document.getElementById('btnCorruptCommitment');
+if (btnCorruptCommitment) {
+  btnCorruptCommitment.addEventListener('click', () => {
+    const inp = document.getElementById('labCommTampered');
+    if (inp) inp.value = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+  });
+}
+
+const btnVerifyCommTamper = document.getElementById('btnVerifyCommTamper');
+if (btnVerifyCommTamper) {
+  btnVerifyCommTamper.addEventListener('click', async () => {
+    const vector = await getBaseLabTestVector();
+    const tamperedComm = document.getElementById('labCommTampered').value;
+
+    vector.auditTrail[1].commitment = tamperedComm;
+    const report = await verifyAuditTrail(vector.auditTrail, vector);
+
+    const resBox = document.getElementById('labCommResult');
+    if (resBox) {
+      resBox.classList.remove('hidden');
+      const realHash = await computeClientCommitment(vector.auditTrail[1].id, vector.auditTrail[1].revealedSecret);
+
+      if (!report.verified) {
+        resBox.innerHTML = `
+          <div class="alert-box-danger">
+            <h3>❌ ATTACK DETECTED / VERIFICATION FAILED</h3>
+            <p><strong>Independent Verification Result:</strong> Stored commitment mismatch.</p>
+            <div class="tamper-details">
+              <div>Real Preimage Hash: <code>${escapeHtml(realHash)}</code></div>
+              <div>Tampered Stored Commitment: <code>${escapeHtml(tamperedComm)}</code></div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: Audit integrity ensures neither participants nor server can tamper with committed hashes without instant detection.</div>
+            </div>
+          </div>
+        `;
+      } else {
+        resBox.innerHTML = `<div class="alert-box-success"><h3>✓ Verification Passed</h3></div>`;
+      }
+    }
+  });
+}
+
+// Exp C: Participant-ID Tampering Handlers
+const labIdOrigPidInput = document.getElementById('labIdOrigPid');
+const labIdTamperedPidInput = document.getElementById('labIdTamperedPid');
+const labIdSecretInput = document.getElementById('labIdSecret');
+if (labIdOrigPidInput) labIdOrigPidInput.addEventListener('input', refreshSecurityLabPreviews);
+if (labIdTamperedPidInput) labIdTamperedPidInput.addEventListener('input', refreshSecurityLabPreviews);
+if (labIdSecretInput) labIdSecretInput.addEventListener('input', refreshSecurityLabPreviews);
+
+const btnVerifyIdTamper = document.getElementById('btnVerifyIdTamper');
+if (btnVerifyIdTamper) {
+  btnVerifyIdTamper.addEventListener('click', async () => {
+    const vector = await getBaseLabTestVector();
+    const tamperedPid = document.getElementById('labIdTamperedPid').value;
+
+    vector.auditTrail[2].id = tamperedPid;
+    const report = await verifyAuditTrail(vector.auditTrail, vector);
+
+    const resBox = document.getElementById('labIdResult');
+    if (resBox) {
+      resBox.classList.remove('hidden');
+      const origPid = document.getElementById('labIdOrigPid').value;
+      const secret = document.getElementById('labIdSecret').value;
+      const origComm = await computeClientCommitment(origPid, secret);
+      const tampComm = await computeClientCommitment(tamperedPid, secret);
+
+      if (!report.verified) {
+        resBox.innerHTML = `
+          <div class="alert-box-danger">
+            <h3>❌ ATTACK DETECTED / VERIFICATION FAILED</h3>
+            <p><strong>Identity Binding Violation:</strong> Commitment verification failed for impersonated ID.</p>
+            <div class="tamper-details">
+              <div>Original ID Hash: <code>${escapeHtml(origComm)}</code></div>
+              <div>Impersonator ID Hash: <code>${escapeHtml(tampComm)}</code></div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: SHA-256(Participant ID + ":" + Secret) binds the commitment to the sender's identity, preventing replay and impersonation attacks.</div>
+            </div>
+          </div>
+        `;
+      } else {
+        resBox.innerHTML = `<div class="alert-box-success"><h3>✓ Verification Passed</h3></div>`;
+      }
+    }
+  });
+}
+
+// Exp D: Winner Tampering Handlers
+const btnVerifyWinnerTamper = document.getElementById('btnVerifyWinnerTamper');
+if (btnVerifyWinnerTamper) {
+  btnVerifyWinnerTamper.addEventListener('click', async () => {
+    const vector = await getBaseLabTestVector();
+    const fakeName = document.getElementById('labWinTamperedName').value;
+    const fakeIdx = parseInt(document.getElementById('labWinTamperedIndex').value, 10);
+
+    const originalWinner = vector.winner;
+    const originalIndex = vector.selectedIndex;
+
+    // Fraudulent announcement
+    vector.winner = { id: 'usr_attacker', name: fakeName };
+    vector.selectedIndex = fakeIdx;
+
+    const report = await verifyAuditTrail(vector.auditTrail, vector);
+
+    const resBox = document.getElementById('labWinResult');
+    if (resBox) {
+      resBox.classList.remove('hidden');
+      if (!report.verified) {
+        resBox.innerHTML = `
+          <div class="alert-box-danger">
+            <h3>❌ ATTACK DETECTED / VERIFICATION FAILED</h3>
+            <p><strong>Fraudulent Winner Announcement Caught:</strong> Client selection recomputation disagrees with claimed result.</p>
+            <div class="tamper-details">
+              <div>Independently Calculated Winner: <code>${escapeHtml(originalWinner.name)} (Index ${originalIndex})</code></div>
+              <div>Fraudulent Server Winner: <code>${escapeHtml(fakeName)} (Index ${fakeIdx})</code></div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: The client computes the winner independently from the verified entropy seed, rendering server-side outcome manipulation impossible.</div>
+            </div>
+          </div>
+        `;
+      } else {
+        resBox.innerHTML = `<div class="alert-box-success"><h3>✓ Verification Passed</h3></div>`;
+      }
+    }
+  });
+}
+
+// Exp E: Modulo Bias vs Rejection Sampling
+const btnRunModuloCompare = document.getElementById('btnRunModuloCompare');
+if (btnRunModuloCompare) {
+  btnRunModuloCompare.addEventListener('click', () => {
+    const domainSize = parseInt(document.getElementById('labModDomainSelect').value, 10);
+    const n = 3;
+    const limit = domainSize - (domainSize % n);
+
+    // Run 1000 simulated uniform draws from [0, domainSize - 1]
+    const naiveBuckets = [0, 0, 0];
+    const rejectionBuckets = [0, 0, 0];
+    let rejectionsTriggered = 0;
+
+    for (let i = 0; i < 1000; i++) {
+      const v = Math.floor(Math.random() * domainSize);
+      naiveBuckets[v % n]++;
+
+      if (v < limit) {
+        rejectionBuckets[v % n]++;
+      } else {
+        rejectionsTriggered++;
+        // Re-sample candidate until accepted
+        let nextV = Math.floor(Math.random() * domainSize);
+        while (nextV >= limit) {
+          nextV = Math.floor(Math.random() * domainSize);
+        }
+        rejectionBuckets[nextV % n]++;
+      }
+    }
+
+    const resRow = document.getElementById('labModResults');
+    const logBox = document.getElementById('labModComparisonLog');
+    if (resRow) resRow.classList.remove('hidden');
+    if (logBox) logBox.classList.remove('hidden');
+
+    document.getElementById('labModNaiveRejections').textContent = `0 (Unchecked)`;
+    document.getElementById('labModLimit').textContent = `L = ${limit} (Discards values >= ${limit})`;
+    document.getElementById('labModRejectionsTriggered').textContent = `${rejectionsTriggered} / 1000 draws`;
+
+    if (logBox) {
+      logBox.innerHTML = `
+        <strong>Empirical Distribution over 1,000 Draws:</strong><br>
+        • Naive Modulo (val % 3): Bucket 0: ${naiveBuckets[0]} (${(naiveBuckets[0]/10).toFixed(1)}%), Bucket 1: ${naiveBuckets[1]} (${(naiveBuckets[1]/10).toFixed(1)}%), Bucket 2: ${naiveBuckets[2]} (${(naiveBuckets[2]/10).toFixed(1)}%)<br>
+        • Fair Pick Rejection Sampling: Bucket 0: ${rejectionBuckets[0]} (${(rejectionBuckets[0]/10).toFixed(1)}%), Bucket 1: ${rejectionBuckets[1]} (${(rejectionBuckets[1]/10).toFixed(1)}%), Bucket 2: ${rejectionBuckets[2]} (${(rejectionBuckets[2]/10).toFixed(1)}%)<br>
+        <br>
+        <em>Theoretical Note: In the naive approach, remainder values in [0, ${domainSize % n - 1}] have probability ${(Math.ceil(domainSize/n) / domainSize * 100).toFixed(2)}%, while higher buckets have ${(Math.floor(domainSize/n) / domainSize * 100).toFixed(2)}%. Rejection sampling eliminates this difference.</em>
+      `;
+    }
+  });
+}
+
+// Initialize Security Lab previews on startup
+setTimeout(refreshSecurityLabPreviews, 500);
 
 // Utility
 function escapeHtml(str) {
