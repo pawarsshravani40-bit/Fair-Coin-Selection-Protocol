@@ -34,7 +34,7 @@ function generateClientSecret() {
 
 async function computeClientCommitment(participantId, secret) {
   const enc = new TextEncoder();
-  const data = enc.encode(String(participantId) + String(secret));
+  const data = enc.encode(String(participantId) + ':' + String(secret));
   const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -306,13 +306,17 @@ attackDemoBtn.addEventListener('click', () => {
 
 // Force Timeout Button
 const forceTimeoutBtn = document.getElementById('forceTimeoutBtn');
-forceTimeoutBtn.addEventListener('click', () => {
-  socket.emit('force_timeout', (response) => {
-    if (response.success) {
-      showAlert('Timeout applied to non-revealing participants.', 'info');
-    }
+if (forceTimeoutBtn) {
+  forceTimeoutBtn.addEventListener('click', () => {
+    socket.emit('force_timeout', (response) => {
+      if (response && response.success) {
+        showAlert('Timeout applied to non-revealing participants.', 'info');
+      } else if (response && response.error) {
+        showAlert(response.error, 'danger');
+      }
+    });
   });
-});
+}
 
 // View Audit Details
 const toggleAuditBtn = document.getElementById('toggleAuditBtn');
@@ -355,14 +359,14 @@ socket.on('protocol_started', (room) => {
 socket.on('commitments_locked', (room) => {
   state.roomData = room;
   const banner = document.getElementById('lockedBanner');
-  banner.classList.remove('hidden');
+  if (banner) {
+    banner.classList.remove('hidden');
+    setTimeout(() => {
+      banner.classList.add('hidden');
+    }, 4000);
+  }
 
   showAlert('All commitments received! Commitments locked 🔐. Entering Reveal Phase.', 'info', 5000);
-
-  setTimeout(() => {
-    banner.classList.add('hidden');
-  }, 4000);
-
   updateProtocolUI(room);
 });
 
@@ -372,6 +376,12 @@ socket.on('attack_detected', (data) => {
 
 socket.on('winner_announced', (room) => {
   state.roomData = room;
+  updateProtocolUI(room);
+});
+
+socket.on('protocol_aborted', (room) => {
+  state.roomData = room;
+  showAlert(room.result?.error || 'Protocol aborted: Insufficient valid reveals.', 'danger', 8000);
   updateProtocolUI(room);
 });
 
@@ -456,21 +466,32 @@ function updateProtocolUI(room) {
   } else if (room.state === 'REVEAL') {
     commitControls.classList.add('hidden');
     revealControls.classList.remove('hidden');
-    timeoutControls.classList.remove('hidden');
+    timeoutControls.classList.add('hidden');
     winnerSection.classList.add('hidden');
-  } else if (room.state === 'COMPLETED') {
+  } else if (room.state === 'COMPLETED' || room.state === 'ABORTED') {
     commitControls.classList.add('hidden');
     revealControls.classList.add('hidden');
     timeoutControls.classList.add('hidden');
-    winnerSection.classList.remove('hidden');
 
-    // Populate Winner
-    if (room.result && room.result.winner) {
+    if (room.state === 'ABORTED') {
+      winnerSection.classList.remove('hidden');
+      const crown = document.querySelector('.winner-crown');
+      if (crown) crown.textContent = '⚠️';
+      const title = document.querySelector('.winner-title');
+      if (title) title.textContent = 'PROTOCOL ABORTED';
+      document.getElementById('winnerNameDisplay').textContent = room.result?.error || 'Insufficient valid reveals (minimum 2 required).';
+    } else if (room.result && room.result.winner) {
+      winnerSection.classList.remove('hidden');
+      const crown = document.querySelector('.winner-crown');
+      if (crown) crown.textContent = '👑';
+      const title = document.querySelector('.winner-title');
+      if (title) title.textContent = '🎉 WINNER 🎉';
       document.getElementById('winnerNameDisplay').textContent = room.result.winner.name;
       document.getElementById('auditCombinedSeed').textContent = room.result.combinedRandomness;
       document.getElementById('auditSampleVal').textContent = room.result.sampleValue;
       document.getElementById('auditRejections').textContent = room.result.rejections;
       document.getElementById('auditIndex').textContent = `${room.result.selectedIndex} (${room.result.winner.name})`;
+    }
 
       // Populate Audit Table
       const auditTbody = document.getElementById('auditTableBody');
