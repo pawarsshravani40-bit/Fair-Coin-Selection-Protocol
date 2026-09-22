@@ -479,7 +479,7 @@ class Room:
     def handle_timeout(self):
         """Authoritative timeout: only allows closure if deadline has expired."""
         if self.state != STATES["REVEAL"]:
-            return
+            raise ValueError(f"Cannot handle timeout in state: {self.state}")
         if self.reveal_deadline and time.time() < self.reveal_deadline:
             raise ValueError("Cannot force timeout: reveal deadline has not expired")
         self.close_reveal_and_finalize()
@@ -530,8 +530,12 @@ class RoomManager:
         for code in stale_codes:
             self.delete_room(code)
 
+    MAX_ROOMS = 500
+
     def create_room(self, host_id: str, host_name: str, required_participants: int, reveal_duration_seconds: float = REVEAL_TIMEOUT_SECONDS) -> Room:
         self.cleanup_stale_rooms()
+        if len(self.rooms) >= self.MAX_ROOMS:
+            raise ValueError(f"Server room capacity reached ({self.MAX_ROOMS} maximum concurrent rooms). Please try again later.")
         clean_name = str(host_name).strip()[:30] or "Host"
         try:
             count = int(required_participants)
@@ -565,11 +569,12 @@ class RoomManager:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI Application & Socket.IO Mock Adapter
+# FastAPI Application & Native WebSocket Protocol Server
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Fair Coin Selection Protocol")
 room_manager = RoomManager()
+sim_lock = asyncio.Lock()
 
 # Map WebSocket -> client_id & room_code
 ws_clients: Dict[WebSocket, str] = {}
@@ -597,35 +602,42 @@ async def send_response(ws: WebSocket, request_id: Optional[str], success: bool,
 @app.get("/api/simulate")
 async def simulate(
     n: int = Query(5, ge=2, le=20),
-    trials: int = Query(10000, ge=100, le=100000)
+    trials: int = Query(10000, ge=100, le=50000)
 ):
-    counts = [0] * n
-    total_rejections = 0
+    if sim_lock.locked():
+        return JSONResponse(
+            {"error": "A simulation is currently in progress. Please wait for it to complete."},
+            status_code=429
+        )
 
-    for _ in range(trials):
-        sec_list = [generate_secret() for _ in range(n)]
-        comb = combine_randomness(sec_list)
-        sel = unbiased_select(comb, n)
-        counts[sel["index"]] += 1
-        total_rejections += sel["rejections"]
+    async with sim_lock:
+        counts = [0] * n
+        total_rejections = 0
 
-    expected_count = trials / n
-    expected_pct = 100.0 / n
-    percentages = [(c / trials) * 100.0 for c in counts]
+        for _ in range(trials):
+            sec_list = [generate_secret() for _ in range(n)]
+            comb = combine_randomness(sec_list)
+            sel = unbiased_select(comb, n)
+            counts[sel["index"]] += 1
+            total_rejections += sel["rejections"]
 
-    chi_sq = sum(((c - expected_count) ** 2) / expected_count for c in counts)
-    max_dev = max(abs(p - expected_pct) for p in percentages)
+        expected_count = trials / n
+        expected_pct = 100.0 / n
+        percentages = [(c / trials) * 100.0 for c in counts]
 
-    return JSONResponse({
-        "n": n,
-        "trials": trials,
-        "counts": counts,
-        "percentages": [round(p, 3) for p in percentages],
-        "expectedPercentage": round(expected_pct, 3),
-        "chiSquare": round(chi_sq, 3),
-        "maxDeviation": round(max_dev, 3),
-        "totalRejections": total_rejections,
-    })
+        chi_sq = sum(((c - expected_count) ** 2) / expected_count for c in counts)
+        max_dev = max(abs(p - expected_pct) for p in percentages)
+
+        return JSONResponse({
+            "n": n,
+            "trials": trials,
+            "counts": counts,
+            "percentages": [round(p, 3) for p in percentages],
+            "expectedPercentage": round(expected_pct, 3),
+            "chiSquare": round(chi_sq, 3),
+            "maxDeviation": round(max_dev, 3),
+            "totalRejections": total_rejections,
+        })
 
 
 async def broadcast_to_room(room_code: str, event: str, data: dict):
@@ -682,10 +694,24 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     client_id: Optional[str] = None
     current_room_code: Optional[str] = None
+    msg_timestamps: List[float] = []
 
     try:
         while True:
             text = await websocket.receive_text()
+
+            # Per-connection rate limiting (max 40 messages per second)
+            now = time.time()
+            msg_timestamps = [t for t in msg_timestamps if (now - t) < 1.0]
+            if len(msg_timestamps) >= 40:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "error": "Rate limit exceeded (maximum 40 requests/sec). Please throttle requests."
+                }))
+                await asyncio.sleep(0.1)
+                continue
+            msg_timestamps.append(now)
+
             if len(text) > MAX_MESSAGE_SIZE:
                 await websocket.send_text(json.dumps({
                     "type": "error",

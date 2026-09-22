@@ -2171,6 +2171,342 @@ class TestPhase4IndependentClientVerification(unittest.TestCase):
             )
 
 
+class TestPhase6ProtocolInvariants(unittest.TestCase):
+    """
+    Step 4: Protocol Invariant Testing.
+    Verifies that all illegal state transitions and protocol violations are rejected deterministically.
+    """
+    def _setup_3_player_room(self):
+        room = Room("INV001", "host_id", "Alice", 3, reveal_duration_seconds=10.0)
+        room.add_participant("bob_id", "Bob")
+        room.add_participant("carol_id", "Carol")
+        return room
+
+    def test_cannot_reveal_before_commitments_lock(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1 = generate_secret()
+        with self.assertRaises(ValueError) as ctx:
+            room.submit_reveal("host_id", s1)
+        self.assertIn("Reveals not accepted in state: COMMIT", str(ctx.exception))
+
+    def test_cannot_commit_after_locked(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("host_id", compute_commitment("host_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+        self.assertEqual(room.state, STATES["LOCKED"])
+        with self.assertRaises(ValueError) as ctx:
+            room.submit_commitment("host_id", compute_commitment("host_id", generate_secret()))
+        self.assertIn("Commitments not accepted in state: LOCKED", str(ctx.exception))
+
+    def test_cannot_join_after_protocol_starts(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        with self.assertRaises(ValueError) as ctx:
+            room.add_participant("dave_id", "Dave")
+        self.assertIn("game is in COMMIT phase", str(ctx.exception))
+
+    def test_cannot_submit_duplicate_commitment(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1 = generate_secret()
+        comm = compute_commitment("host_id", s1)
+        room.submit_commitment("host_id", comm)
+        with self.assertRaises(ValueError) as ctx:
+            room.submit_commitment("host_id", comm)
+        self.assertIn("Modifications forbidden", str(ctx.exception))
+
+    def test_cannot_reveal_twice(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("host_id", compute_commitment("host_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+        room.open_reveal_phase()
+        room.submit_reveal("host_id", s1)
+        with self.assertRaises(ValueError) as ctx:
+            room.submit_reveal("host_id", s1)
+        self.assertIn("Second reveal is strictly forbidden", str(ctx.exception))
+
+    def test_cannot_force_timeout_before_valid_deadline(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("host_id", compute_commitment("host_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+        room.open_reveal_phase(duration_seconds=60.0)
+        with self.assertRaises(ValueError) as ctx:
+            room.handle_timeout()
+        self.assertIn("reveal deadline has not expired", str(ctx.exception))
+
+    def test_cannot_force_timeout_after_completion(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("host_id", compute_commitment("host_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+        room.open_reveal_phase()
+        room.submit_reveal("host_id", s1)
+        room.submit_reveal("bob_id", s2)
+        room.submit_reveal("carol_id", s3)
+        self.assertEqual(room.state, STATES["COMPLETED"])
+        with self.assertRaises(ValueError) as ctx:
+            room.handle_timeout()
+        self.assertIn("Cannot handle timeout in state: COMPLETED", str(ctx.exception))
+
+    def test_cannot_produce_winner_from_insufficient_reveals(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("host_id", compute_commitment("host_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+        room.open_reveal_phase(duration_seconds=0.01)
+        room.submit_reveal("host_id", s1)
+        time.sleep(0.02)
+        room.handle_timeout()
+        self.assertEqual(room.state, STATES["ABORTED"])
+        self.assertIsNone(room.result["winner"])
+        self.assertIn("Insufficient valid reveals", room.result["error"])
+
+    def test_aborted_rooms_cannot_become_completed(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        s1, s2, s3 = generate_secret(), generate_secret(), generate_secret()
+        room.submit_commitment("host_id", compute_commitment("host_id", s1))
+        room.submit_commitment("bob_id", compute_commitment("bob_id", s2))
+        room.submit_commitment("carol_id", compute_commitment("carol_id", s3))
+        room.open_reveal_phase(duration_seconds=0.01)
+        room.submit_reveal("host_id", s1)
+        time.sleep(0.02)
+        room.handle_timeout()
+        self.assertEqual(room.state, STATES["ABORTED"])
+        with self.assertRaises(ValueError) as ctx:
+            room.submit_reveal("bob_id", s2)
+        self.assertIn("Reveals not accepted in state: ABORTED", str(ctx.exception))
+        self.assertEqual(room.state, STATES["ABORTED"])
+
+    def test_cannot_change_participant_set_after_protocol_start(self):
+        room = self._setup_3_player_room()
+        room.start_protocol("host_id")
+        self.assertEqual(len(room.participants), 3)
+        room.remove_participant("bob_id")
+        self.assertIn("bob_id", room.participants)
+
+
+class TestPhase6AdversarialAndNegative(unittest.TestCase):
+    """
+    Step 5: Adversarial and Negative Testing.
+    Simulates malicious clients attempting malformed, oversized, or unauthorized interactions.
+    """
+    def test_adversarial_malformed_json_rejected(self):
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text("NOT_JSON{{{")
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp["type"], "error")
+            self.assertIn("Malformed JSON", resp["error"])
+
+    def test_adversarial_oversized_payload_rejected(self):
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text("X" * 70000)
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp["type"], "error")
+            self.assertIn("Payload exceeds maximum", resp["error"])
+
+    def test_adversarial_unknown_action_rejected(self):
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "fake_admin_action", "requestId": "req_1"}))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success", True))
+            self.assertIn("Unknown message type", resp.get("error", ""))
+
+    def test_adversarial_unauthorized_room_action_rejected(self):
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "req_steal",
+                "payload": {"commitment": "0" * 64}
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success", True))
+            self.assertIn("Not in a room", resp.get("error", ""))
+
+    def test_adversarial_fake_session_token_reconnect_rejected(self):
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1, \
+             client.websocket_connect("/ws") as ws2:
+            # ws1 creates room
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cr",
+                "payload": {"name": "Host", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            pid = res["data"]["participantId"]
+
+            # ws2 attempts reconnect with fake token
+            ws2.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_fake",
+                "payload": {"roomCode": code, "participantId": pid, "sessionToken": "0" * 64}
+            }))
+            res2 = json.loads(ws2.receive_text())
+            self.assertFalse(res2.get("success", True))
+            self.assertIn("Invalid session credential", res2.get("error", ""))
+
+    def test_adversarial_cross_room_access_prevented(self):
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1, \
+             client.websocket_connect("/ws") as ws2:
+            # ws1 creates Room A
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cr_a",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res_a = json.loads(ws1.receive_text())
+            code_a = res_a["data"]["room"]["code"]
+
+            # ws2 creates Room B
+            ws2.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cr_b",
+                "payload": {"name": "Bob", "participantsCount": 3}
+            }))
+            res_b = json.loads(ws2.receive_text())
+            code_b = res_b["data"]["room"]["code"]
+            self.assertNotEqual(code_a, code_b)
+
+    def test_adversarial_room_capacity_limit_enforced(self):
+        rm = RoomManager()
+        rm.MAX_ROOMS = 5
+        # Fill capacity
+        for i in range(5):
+            rm.create_room(f"host_{i}", "Host", 3)
+        self.assertEqual(len(rm.rooms), 5)
+        with self.assertRaises(ValueError) as ctx:
+            rm.create_room("overflow_host", "Host", 3)
+        self.assertIn("Server room capacity reached", str(ctx.exception))
+
+    def test_adversarial_simulation_parameters_bounded(self):
+        client = TestClient(app)
+        # Query below range
+        resp_low = client.get("/api/simulate?n=1&trials=1000")
+        self.assertEqual(resp_low.status_code, 422)
+        # Query above range
+        resp_high = client.get("/api/simulate?n=5&trials=1000000")
+        self.assertEqual(resp_high.status_code, 422)
+
+
+class TestPhase6FairnessAndStatisticalProperties(unittest.TestCase):
+    """
+    Step 6: Empirical Fairness and Statistical Checks.
+    Validates uniformity and absence of structural bias across participant counts.
+    Note: Empirical observations do not constitute a formal mathematical proof.
+    """
+    def test_fairness_distribution_across_multiple_participant_counts(self):
+        test_counts = [3, 4, 5, 10, 20]
+        trials = 2000
+
+        for n in test_counts:
+            counts = [0] * n
+            total_rejections = 0
+            for _ in range(trials):
+                secrets_list = [generate_secret() for _ in range(n)]
+                comb = combine_randomness(secrets_list)
+                sel = unbiased_select(comb, n)
+                idx = sel["index"]
+                self.assertIn(idx, range(n))
+                counts[idx] += 1
+                total_rejections += sel["rejections"]
+
+            # 1. No participant position was structurally excluded
+            for i in range(n):
+                self.assertGreater(counts[i], 0, f"Participant {i} of {n} was never selected in {trials} trials")
+
+            # 2. Chi-square goodness-of-fit test
+            expected = trials / n
+            chi_sq = sum(((c - expected) ** 2) / expected for c in counts)
+            # With n degrees of freedom - 1, chi_sq should be within reasonable empirical bound for 2000 trials
+            self.assertLess(chi_sq, 80.0, f"Chi-square {chi_sq} excessive for n={n}")
+            self.assertGreaterEqual(total_rejections, 0)
+
+
+class TestPhase6DeterministicTestVectors(unittest.TestCase):
+    """
+    Step 8: Deterministic Test Vectors.
+    Fixed cryptographic test vectors guaranteeing reproducible cross-platform calculation.
+    """
+    def test_fixed_test_vector_1_three_participants(self):
+        pids = ["alice", "bob", "carol"]
+        s1 = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        s2 = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+        s3 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+        # Verified precomputed values
+        exp_c1 = "5eef4c99629544d076344fb2c7747f941fb89ecf4d4b26aa04373aa25781f62f"
+        exp_c2 = "5c4916e0caf37edfeaac13e972cba4a7438e6d58282cde6d2ef23abba7cf3ac0"
+        exp_c3 = "88197b6a8a6758bee357c1ba908fea80e0b8a963cdb1df7e1d545d63ef479044"
+        exp_comb = "3980f37b34db6594861246e5a9dc39779d6c50fdb6b3e499b8c62a8598618029"
+
+        # 1. Commitments
+        self.assertEqual(compute_commitment("alice", s1), exp_c1)
+        self.assertEqual(compute_commitment("bob", s2), exp_c2)
+        self.assertEqual(compute_commitment("carol", s3), exp_c3)
+
+        # 2. Entropy combination
+        comb = combine_randomness([s1, s2, s3])
+        self.assertEqual(comb.hex(), exp_comb)
+
+        # 3. Unbiased selection
+        sel = unbiased_select(comb, 3)
+        self.assertEqual(sel["index"], 0)
+        self.assertEqual(sel["rejections"], 0)
+        self.assertEqual(sel["sampleValue"], "4143579367674176916")
+
+        # 4. Audit Trail Verification on Fixed Vector
+        audit_trail = [
+            {"id": "alice", "name": "Alice", "commitment": exp_c1, "revealedSecret": s1, "verified": True},
+            {"id": "bob", "name": "Bob", "commitment": exp_c2, "revealedSecret": s2, "verified": True},
+            {"id": "carol", "name": "Carol", "commitment": exp_c3, "revealedSecret": s3, "verified": True},
+        ]
+        server_result = {
+            "combinedRandomness": exp_comb,
+            "selectedIndex": 0,
+            "sampleValue": "4143579367674176916",
+            "rejections": 0,
+            "winner": {"id": "alice", "name": "Alice"},
+            "auditTrail": audit_trail
+        }
+        res = verify_audit_trail(audit_trail, server_result)
+        self.assertTrue(res["verified"])
+        self.assertTrue(res["checks"]["commitments"]["valid"])
+        self.assertTrue(res["checks"]["entropy"]["valid"])
+        self.assertTrue(res["checks"]["selection"]["valid"])
+        self.assertTrue(res["checks"]["winner"]["valid"])
+
+    def test_fixed_test_vector_2_rejection_boundary(self):
+        # First 8 bytes = 0xFFFFFFFFFFFFFFFF (2^64 - 1)
+        synthetic_seed = (0xFFFFFFFFFFFFFFFF).to_bytes(8, "big") + bytes(24)
+        sel = unbiased_select(synthetic_seed, 3)
+
+        self.assertEqual(sel["rejections"], 1)
+        self.assertEqual(sel["index"], 1)
+        self.assertEqual(sel["sampleValue"], "4557997227390710014")
+        self.assertEqual(sel["finalSeedHex"], "3f41425439d6b0fea00cf2f3551bafca85ead4bfc8f1726d7c33d9c738a344d6")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -1,6 +1,22 @@
+# Dependencies and runtime artifacts
 node_modules/
-.DS_Store
-*.log
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Environment and local virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Operating system and editor metadata
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
 
