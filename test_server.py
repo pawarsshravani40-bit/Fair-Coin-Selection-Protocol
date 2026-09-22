@@ -686,5 +686,1016 @@ class TestWebSocketSelectiveAbortMitigation(unittest.TestCase):
             self.assertIn("Insufficient valid reveals", abort_alice["data"]["result"]["error"])
 
 
+class TestPhase3NativeWebSocketAndSessionRecovery(unittest.TestCase):
+    """28 comprehensive tests for Native WebSocket Migration and Session Recovery."""
+
+    def test_01_malformed_json_rejected(self):
+        """1. Server gracefully rejects malformed JSON without crashing."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text("this is definitely not json {[[")
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp.get("type"), "error")
+            self.assertIn("Malformed JSON", resp.get("error", ""))
+
+    def test_02_non_object_json_rejected(self):
+        """2. Server rejects non-object JSON payloads (e.g. array or primitive)."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps([1, 2, 3]))
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp.get("type"), "error")
+            self.assertIn("JSON object", resp.get("error", ""))
+
+    def test_03_missing_or_invalid_type_rejected(self):
+        """3. Server rejects messages lacking a valid string action/type."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"requestId": "test_req"}))
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp.get("type"), "error")
+            self.assertIn("Missing or invalid message type", resp.get("error", ""))
+
+    def test_04_unknown_action_rejected(self):
+        """4. Server returns structured error response for unknown action types."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "nonexistent_action_xyz", "requestId": "req_unk"}))
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp.get("type"), "response")
+            self.assertEqual(resp.get("requestId"), "req_unk")
+            self.assertFalse(resp.get("success"))
+            self.assertIn("Unknown message type", resp.get("error", ""))
+
+    def test_05_oversized_payload_rejected(self):
+        """5. Server rejects payloads exceeding MAX_MESSAGE_SIZE (64KB)."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            oversized = json.dumps({"type": "create_room", "payload": {"blob": "X" * 70000}})
+            ws.send_text(oversized)
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp.get("type"), "error")
+            self.assertIn("Payload exceeds maximum", resp.get("error", ""))
+
+    def test_06_request_id_correlation_in_response(self):
+        """6. Server correlates responses with client-supplied requestId."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            req_id = "custom_req_uuid_987654"
+            ws.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": req_id,
+                "payload": {"name": "HostUser", "participantsCount": 3}
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertEqual(resp.get("type"), "response")
+            self.assertEqual(resp.get("requestId"), req_id)
+            self.assertTrue(resp.get("success"))
+
+    def test_07_native_create_room_returns_session_token(self):
+        """7. Native create_room issues unpredictable session token and participantId."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cr_1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertTrue(resp.get("success"))
+            data = resp.get("data", {})
+            self.assertIn("participantId", data)
+            self.assertIn("sessionToken", data)
+            self.assertEqual(len(data["sessionToken"]), 64)
+            self.assertTrue(HEX_64_REGEX.match(data["sessionToken"]))
+
+    def test_08_native_join_room_returns_session_token(self):
+        """8. Native join_room issues unpredictable session token and participantId."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_host, \
+             client.websocket_connect("/ws") as ws_guest:
+            ws_host.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cr_h",
+                "payload": {"name": "Host", "participantsCount": 3}
+            }))
+            host_resp = json.loads(ws_host.receive_text())
+            room_code = host_resp["data"]["room"]["code"]
+            _ = json.loads(ws_host.receive_text())  # room_updated
+
+            ws_guest.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "jr_g",
+                "payload": {"code": room_code, "name": "Guest"}
+            }))
+            guest_resp = json.loads(ws_guest.receive_text())
+            self.assertTrue(guest_resp.get("success"))
+            data = guest_resp.get("data", {})
+            self.assertIn("participantId", data)
+            self.assertIn("sessionToken", data)
+            self.assertEqual(len(data["sessionToken"]), 64)
+            self.assertTrue(HEX_64_REGEX.match(data["sessionToken"]))
+
+    def test_09_join_room_invalid_code_format(self):
+        """9. Native join_room rejects invalid code length or characters."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            # Too short
+            ws.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "jr_bad1",
+                "payload": {"code": "ABC", "name": "Guest"}
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success"))
+            self.assertIn("Invalid room code format", resp.get("error", ""))
+
+            # Non-alphanumeric
+            ws.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "jr_bad2",
+                "payload": {"code": "AB!@#$", "name": "Guest"}
+            }))
+            resp2 = json.loads(ws.receive_text())
+            self.assertFalse(resp2.get("success"))
+            self.assertIn("Invalid room code format", resp2.get("error", ""))
+
+    def test_10_join_nonexistent_room(self):
+        """10. Native join_room rejects non-existent room codes."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "jr_none",
+                "payload": {"code": "ZZZZZZ", "name": "Guest"}
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success"))
+            self.assertIn("Room not found", resp.get("error", ""))
+
+    def test_11_join_full_room_rejected(self):
+        """11. Joining a room that has reached required_participants is rejected."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_host, \
+             client.websocket_connect("/ws") as ws_extra:
+            ws_host.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cr",
+                "payload": {"name": "Host", "participantsCount": 3}
+            }))
+            host_resp = json.loads(ws_host.receive_text())
+            room_code = host_resp["data"]["room"]["code"]
+            _ = json.loads(ws_host.receive_text())
+
+            # Add two bots to fill room (1 host + 2 bots = 3)
+            ws_host.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws_host.receive_text())
+            _ = json.loads(ws_host.receive_text())
+
+            ws_host.send_text(json.dumps({"type": "add_bot", "requestId": "b2"}))
+            _ = json.loads(ws_host.receive_text())
+            _ = json.loads(ws_host.receive_text())
+
+            # Extra guest attempts to join full room
+            ws_extra.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "jr_full",
+                "payload": {"code": room_code, "name": "Extra"}
+            }))
+            resp = json.loads(ws_extra.receive_text())
+            self.assertFalse(resp.get("success"))
+            self.assertIn("full", resp.get("error", "").lower())
+
+    def test_12_unauthorized_action_without_room_rejected(self):
+        """12. Room-scoped actions before joining any room are rejected."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "start_protocol",
+                "requestId": "unauth_start"
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success"))
+            self.assertIn("Not in a room", resp.get("error", ""))
+
+    def test_13_reconnect_success_with_valid_session_token(self):
+        """13. Reconnection succeeds with valid credentials and restores connected state."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            alice_pid = res["data"]["participantId"]
+            alice_token = res["data"]["sessionToken"]
+            _ = json.loads(ws1.receive_text())  # room_updated
+
+            ws1.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            ws1.send_text(json.dumps({"type": "add_bot", "requestId": "b2"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+
+            ws1.send_text(json.dumps({"type": "start_protocol", "requestId": "s1"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+
+        # Alice disconnects (ws1 block exits). Now Alice reconnects on a fresh WebSocket connection
+        with client.websocket_connect("/ws") as ws_alice_rec:
+            ws_alice_rec.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec1",
+                "payload": {
+                    "roomCode": code,
+                    "participantId": alice_pid,
+                    "sessionToken": alice_token
+                }
+            }))
+            rec_resp = json.loads(ws_alice_rec.receive_text())
+            self.assertTrue(rec_resp.get("success"))
+            data = rec_resp.get("data", {})
+            self.assertEqual(data.get("participantId"), alice_pid)
+            self.assertEqual(data.get("sessionToken"), alice_token)
+            reconnected_part = next(p for p in data["room"]["participants"] if p["id"] == alice_pid)
+            self.assertTrue(reconnected_part["connected"])
+
+    def test_14_reconnect_does_not_duplicate_participant(self):
+        """14. Reconnecting does not create a duplicate participant record."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            pid = res["data"]["participantId"]
+            token = res["data"]["sessionToken"]
+            _ = json.loads(ws1.receive_text())
+
+            # Add a second participant
+            ws2 = client.websocket_connect("/ws")
+            ws2.__enter__()
+            ws2.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "j2",
+                "payload": {"code": code, "name": "Bob"}
+            }))
+            res2 = json.loads(ws2.receive_text())
+            bob_pid = res2["data"]["participantId"]
+            bob_token = res2["data"]["sessionToken"]
+            _ = json.loads(ws1.receive_text())
+
+            # Start protocol so Bob won't be removed on disconnect
+            ws1.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            ws1.send_text(json.dumps({"type": "start_protocol", "requestId": "s1"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            # Bob disconnects
+            ws2.close()
+            _ = json.loads(ws1.receive_text())
+
+            # Bob reconnects
+            ws3 = client.websocket_connect("/ws")
+            ws3.__enter__()
+            ws3.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_bob",
+                "payload": {
+                    "roomCode": code,
+                    "participantId": bob_pid,
+                    "sessionToken": bob_token
+                }
+            }))
+            rec_res = json.loads(ws3.receive_text())
+            self.assertTrue(rec_res.get("success"))
+            self.assertEqual(len(rec_res["data"]["room"]["participants"]), 3)
+            ws3.close()
+
+    def test_15_reconnect_rejected_on_invalid_session_token(self):
+        """15. Reconnection with a forged session token fails authentication."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            pid = res["data"]["participantId"]
+
+            # Attacker tries to reconnect with tampered sessionToken while room is alive
+            with client.websocket_connect("/ws") as ws_attacker:
+                ws_attacker.send_text(json.dumps({
+                    "type": "reconnect",
+                    "requestId": "atk_rec",
+                    "payload": {
+                        "roomCode": code,
+                        "participantId": pid,
+                        "sessionToken": "0" * 64
+                    }
+                }))
+                atk_res = json.loads(ws_attacker.receive_text())
+                self.assertFalse(atk_res.get("success"))
+                self.assertIn("authentication failed", atk_res.get("error", "").lower())
+
+    def test_16_reconnect_rejected_on_unknown_participant_id(self):
+        """16. Reconnection with a non-existent participantId is rejected."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+
+            with client.websocket_connect("/ws") as ws2:
+                ws2.send_text(json.dumps({
+                    "type": "reconnect",
+                    "requestId": "atk_rec2",
+                    "payload": {
+                        "roomCode": code,
+                        "participantId": "nonexistent_pid",
+                        "sessionToken": "a" * 64
+                    }
+                }))
+                atk_res = json.loads(ws2.receive_text())
+                self.assertFalse(atk_res.get("success"))
+                self.assertIn("authentication failed", atk_res.get("error", "").lower())
+
+    def test_17_reconnect_rejected_on_invalid_room_code(self):
+        """17. Reconnection with invalid or expired room code is rejected."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_bad_code",
+                "payload": {
+                    "roomCode": "XXXXXX",
+                    "participantId": "pid_123",
+                    "sessionToken": "b" * 64
+                }
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success"))
+            self.assertIn("Room not found", resp.get("error", ""))
+
+    def test_18_reconnect_rejected_on_missing_credentials(self):
+        """18. Reconnection missing required credential fields is rejected."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_missing",
+                "payload": {
+                    "roomCode": "ABCDEF"
+                }
+            }))
+            resp = json.loads(ws.receive_text())
+            self.assertFalse(resp.get("success"))
+            self.assertIn("required", resp.get("error", "").lower())
+
+    def test_19_reconnect_during_commit_phase(self):
+        """19. Participant can disconnect and reconnect during COMMIT phase and submit commitment."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_alice:
+            ws_alice.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "ca",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res_a = json.loads(ws_alice.receive_text())
+            code = res_a["data"]["room"]["code"]
+            alice_pid = res_a["data"]["participantId"]
+            alice_token = res_a["data"]["sessionToken"]
+            _ = json.loads(ws_alice.receive_text())
+
+            # Add bots and start
+            ws_alice.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+            ws_alice.send_text(json.dumps({"type": "add_bot", "requestId": "b2"}))
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+
+            ws_alice.send_text(json.dumps({"type": "start_protocol", "requestId": "st"}))
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+
+        # Alice disconnected during COMMIT phase. Now Alice reconnects:
+        with client.websocket_connect("/ws") as ws_alice_new:
+            ws_alice_new.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_a",
+                "payload": {
+                    "roomCode": code,
+                    "participantId": alice_pid,
+                    "sessionToken": alice_token
+                }
+            }))
+            rec_res = json.loads(ws_alice_new.receive_text())
+            self.assertTrue(rec_res.get("success"))
+            self.assertEqual(rec_res["data"]["room"]["state"], STATES["COMMIT"])
+            _ = json.loads(ws_alice_new.receive_text())  # room_updated broadcast from reconnect
+
+            # Alice submits commitment after reconnecting
+            sec_a = generate_secret()
+            comm_a = compute_commitment(alice_pid, sec_a)
+            ws_alice_new.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_a",
+                "payload": {"commitment": comm_a}
+            }))
+            comm_res = json.loads(ws_alice_new.receive_text())
+            self.assertTrue(comm_res.get("success"))
+
+    def test_20_reconnect_during_reveal_phase_does_not_leak_secrets(self):
+        """20. Reconnection during REVEAL phase does NOT leak unrevealed secrets of any participant."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_alice, \
+             client.websocket_connect("/ws") as ws_bob:
+            ws_alice.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "ca",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res_a = json.loads(ws_alice.receive_text())
+            code = res_a["data"]["room"]["code"]
+            _ = json.loads(ws_alice.receive_text())
+
+            ws_bob.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "jb",
+                "payload": {"code": code, "name": "Bob"}
+            }))
+            res_b = json.loads(ws_bob.receive_text())
+            bob_pid = res_b["data"]["participantId"]
+            bob_token = res_b["data"]["sessionToken"]
+            _ = json.loads(ws_alice.receive_text())
+
+            # Add bot
+            ws_alice.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_bob.receive_text())
+
+            # Start protocol
+            ws_alice.send_text(json.dumps({"type": "start_protocol", "requestId": "st"}))
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_bob.receive_text())
+            _ = json.loads(ws_bob.receive_text())
+
+            # Alice & Bob commit
+            sec_a = generate_secret()
+            sec_b = generate_secret()
+            comm_a = compute_commitment(res_a["data"]["participantId"], sec_a)
+            comm_b = compute_commitment(bob_pid, sec_b)
+
+            ws_alice.send_text(json.dumps({"type": "submit_commitment", "requestId": "ca", "payload": {"commitment": comm_a}}))
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_alice.receive_text())
+            _ = json.loads(ws_bob.receive_text())
+
+            ws_bob.send_text(json.dumps({"type": "submit_commitment", "requestId": "cb", "payload": {"commitment": comm_b}}))
+            _ = json.loads(ws_bob.receive_text())
+            _ = json.loads(ws_alice.receive_text())  # commitments_locked
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # commitments_locked
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+
+            # Alice reveals
+            ws_alice.send_text(json.dumps({"type": "submit_reveal", "requestId": "ra", "payload": {"secret": sec_a}}))
+            _ = json.loads(ws_alice.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+
+        # Bob reconnects on a new connection while reveal phase is active
+        with client.websocket_connect("/ws") as ws_bob_new:
+            ws_bob_new.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_b",
+                "payload": {
+                    "roomCode": code,
+                    "participantId": bob_pid,
+                    "sessionToken": bob_token
+                }
+            }))
+            rec_b_res = json.loads(ws_bob_new.receive_text())
+            self.assertTrue(rec_b_res.get("success"))
+            participants = rec_b_res["data"]["room"]["participants"]
+
+            # Verify neither Alice's secret nor any bot's secret is revealed in public state
+            for p in participants:
+                self.assertIsNone(
+                    p["revealedSecret"],
+                    f"Privacy violation: {p['id']} secret leaked in reconnect response!"
+                )
+            self.assertNotIn(sec_a, json.dumps(rec_b_res))
+
+    def test_21_reconnect_after_completion(self):
+        """21. Reconnecting to a completed room returns finalized state and audit trail."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Host", "participantsCount": 3}
+            }))
+            res = json.loads(ws.receive_text())
+            code = res["data"]["room"]["code"]
+            pid = res["data"]["participantId"]
+            token = res["data"]["sessionToken"]
+            _ = json.loads(ws.receive_text())
+
+            ws.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+            ws.send_text(json.dumps({"type": "add_bot", "requestId": "b2"}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+
+            ws.send_text(json.dumps({"type": "start_protocol", "requestId": "st"}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+
+            sec = generate_secret()
+            comm = compute_commitment(pid, sec)
+            ws.send_text(json.dumps({"type": "submit_commitment", "requestId": "comm", "payload": {"commitment": comm}}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+
+            ws.send_text(json.dumps({"type": "submit_reveal", "requestId": "rev", "payload": {"secret": sec}}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())  # winner_announced
+            _ = json.loads(ws.receive_text())  # room_updated
+
+        # Reconnect on fresh socket
+        with client.websocket_connect("/ws") as ws_reconnect:
+            ws_reconnect.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_final",
+                "payload": {
+                    "roomCode": code,
+                    "participantId": pid,
+                    "sessionToken": token
+                }
+            }))
+            resp = json.loads(ws_reconnect.receive_text())
+            self.assertTrue(resp.get("success"))
+            room_state = resp["data"]["room"]
+            self.assertEqual(room_state["state"], STATES["COMPLETED"])
+            self.assertIsNotNone(room_state["result"]["winner"])
+            self.assertIn("auditTrail", room_state["result"])
+
+    def test_22_reconnect_after_abort(self):
+        """22. Reconnecting to an aborted room returns aborted state and error explanation."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Host", "participantsCount": 3}
+            }))
+            res = json.loads(ws.receive_text())
+            code = res["data"]["room"]["code"]
+            pid = res["data"]["participantId"]
+            token = res["data"]["sessionToken"]
+            _ = json.loads(ws.receive_text())
+
+            ws.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+            ws.send_text(json.dumps({"type": "add_bot", "requestId": "b2"}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+
+            ws.send_text(json.dumps({"type": "start_protocol", "requestId": "st"}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+
+            sec = generate_secret()
+            comm = compute_commitment(pid, sec)
+            ws.send_text(json.dumps({"type": "submit_commitment", "requestId": "comm", "payload": {"commitment": comm}}))
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+            _ = json.loads(ws.receive_text())
+
+            # Force timeout without revealing
+            ws.send_text(json.dumps({"type": "force_timeout", "requestId": "to"}))
+            _ = json.loads(ws.receive_text())  # ack
+            _ = json.loads(ws.receive_text())  # winner_announced or protocol_aborted
+            _ = json.loads(ws.receive_text())  # room_updated
+
+        # Reconnect on fresh socket
+        with client.websocket_connect("/ws") as ws_reconnect:
+            ws_reconnect.send_text(json.dumps({
+                "type": "reconnect",
+                "requestId": "rec_aborted",
+                "payload": {
+                    "roomCode": code,
+                    "participantId": pid,
+                    "sessionToken": token
+                }
+            }))
+            resp = json.loads(ws_reconnect.receive_text())
+            self.assertTrue(resp.get("success"))
+            room_state = resp["data"]["room"]
+            self.assertIn(room_state["state"], (STATES["COMPLETED"], STATES["ABORTED"]))
+
+    def test_23_disconnect_during_commit_preserves_participant(self):
+        """23. Participant disconnect during COMMIT sets connected=False without purging participant."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            _ = json.loads(ws1.receive_text())
+
+            ws2 = client.websocket_connect("/ws")
+            ws2.__enter__()
+            ws2.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "j2",
+                "payload": {"code": code, "name": "Bob"}
+            }))
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws1.receive_text())
+
+            ws1.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            ws1.send_text(json.dumps({"type": "start_protocol", "requestId": "st"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            # Bob disconnects during COMMIT
+            ws2.close()
+            room_upd = json.loads(ws1.receive_text())
+            self.assertEqual(len(room_upd["data"]["participants"]), 3)
+            bob_info = next(p for p in room_upd["data"]["participants"] if p["name"] == "Bob")
+            self.assertFalse(bob_info["connected"])
+
+    def test_24_disconnect_during_reveal_preserves_deadline_and_privacy(self):
+        """24. Participant disconnect during REVEAL retains room progression and secret privacy."""
+        from server import room_manager
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            alice_pid = res["data"]["participantId"]
+            _ = json.loads(ws1.receive_text())
+
+            ws2 = client.websocket_connect("/ws")
+            ws2.__enter__()
+            ws2.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "j2",
+                "payload": {"code": code, "name": "Bob"}
+            }))
+            res2 = json.loads(ws2.receive_text())
+            bob_pid = res2["data"]["participantId"]
+            _ = json.loads(ws1.receive_text())
+
+            ws1.send_text(json.dumps({"type": "add_bot", "requestId": "b1"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            ws1.send_text(json.dumps({"type": "start_protocol", "requestId": "st"}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            sec_a = generate_secret()
+            sec_b = generate_secret()
+            comm_a = compute_commitment(alice_pid, sec_a)
+            comm_b = compute_commitment(bob_pid, sec_b)
+
+            ws1.send_text(json.dumps({"type": "submit_commitment", "requestId": "ca", "payload": {"commitment": comm_a}}))
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            ws2.send_text(json.dumps({"type": "submit_commitment", "requestId": "cb", "payload": {"commitment": comm_b}}))
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws1.receive_text())
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws2.receive_text())
+
+            # In REVEAL phase, Bob disconnects
+            ws2.close()
+            room_upd = json.loads(ws1.receive_text())
+            bob_info = next(p for p in room_upd["data"]["participants"] if p["id"] == bob_pid)
+            self.assertFalse(bob_info["connected"])
+
+            # Verify room is still in REVEAL phase
+            room = room_manager.get_room(code)
+            self.assertIsNotNone(room)
+            self.assertEqual(room.state, STATES["REVEAL"])
+
+    def test_25_disconnect_in_lobby_removes_participant_and_cleans_up(self):
+        """25. Disconnecting in LOBBY removes participant; last participant disconnect cleans up room."""
+        from server import room_manager
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws1:
+            ws1.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "c1",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res = json.loads(ws1.receive_text())
+            code = res["data"]["room"]["code"]
+            _ = json.loads(ws1.receive_text())
+
+            ws2 = client.websocket_connect("/ws")
+            ws2.__enter__()
+            ws2.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "j2",
+                "payload": {"code": code, "name": "Bob"}
+            }))
+            _ = json.loads(ws2.receive_text())
+            _ = json.loads(ws1.receive_text())
+
+            # Bob disconnects in lobby -> removed
+            ws2.close()
+            upd = json.loads(ws1.receive_text())
+            self.assertEqual(len(upd["data"]["participants"]), 1)
+
+        # Alice disconnects (last participant) -> room deleted
+        self.assertIsNone(room_manager.get_room(code))
+
+    def test_26_room_isolation_no_cross_room_leakage(self):
+        """26. Room isolation: Messages and broadcasts in Room A never reach Room B subscribers."""
+        from server import room_subscribers
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_a, \
+             client.websocket_connect("/ws") as ws_b:
+            # Alice creates Room A
+            ws_a.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "cra",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res_a = json.loads(ws_a.receive_text())
+            code_a = res_a["data"]["room"]["code"]
+            _ = json.loads(ws_a.receive_text())  # room_updated A
+
+            # Bob creates Room B
+            ws_b.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "crb",
+                "payload": {"name": "Bob", "participantsCount": 3}
+            }))
+            res_b = json.loads(ws_b.receive_text())
+            code_b = res_b["data"]["room"]["code"]
+            _ = json.loads(ws_b.receive_text())  # room_updated B
+
+            self.assertNotEqual(code_a, code_b)
+
+            # Check subscriber isolation
+            subs_a = room_subscribers.get(code_a, set())
+            subs_b = room_subscribers.get(code_b, set())
+            self.assertNotIn(ws_b, subs_a)
+            self.assertNotIn(ws_a, subs_b)
+
+            # Alice adds bot in Room A
+            ws_a.send_text(json.dumps({"type": "add_bot", "requestId": "bot_a"}))
+            _ = json.loads(ws_a.receive_text())  # ack
+            _ = json.loads(ws_a.receive_text())  # room_updated for A
+
+            # Bob performs an action in Room B and receives ONLY Room B's event
+            ws_b.send_text(json.dumps({"type": "add_bot", "requestId": "bot_b"}))
+            ack_b = json.loads(ws_b.receive_text())
+            self.assertEqual(ack_b.get("requestId"), "bot_b")
+            upd_b = json.loads(ws_b.receive_text())
+            self.assertEqual(upd_b["data"]["code"], code_b)
+            self.assertEqual(len(upd_b["data"]["participants"]), 2)
+
+    def test_27_timing_safe_token_verification(self):
+        """27. Room.verify_session uses timing-safe comparison and handles invalid tokens securely."""
+        room = Room("ISOL01", "host_1", "Host", 3)
+        p = room.participants["host_1"]
+        valid_token = p.session_token
+
+        # 1. Matching token succeeds
+        self.assertEqual(room.verify_session("host_1", valid_token), p)
+        self.assertTrue(p.connected)
+
+        # 2. Tampered token (1 character flipped) fails
+        tampered = valid_token[:-1] + ("0" if valid_token[-1] != "0" else "1")
+        self.assertIsNone(room.verify_session("host_1", tampered))
+
+        # 3. Empty or None token fails
+        self.assertIsNone(room.verify_session("host_1", ""))
+        self.assertIsNone(room.verify_session("host_1", None))
+
+        # 4. Wrong participant id fails
+        self.assertIsNone(room.verify_session("wrong_pid", valid_token))
+
+    def test_28_full_native_websocket_3_player_protocol_e2e(self):
+        """28. Complete 3-player game executed entirely over Native WebSocket JSON protocol."""
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws_alice, \
+             client.websocket_connect("/ws") as ws_bob, \
+             client.websocket_connect("/ws") as ws_carol:
+
+            # 1. Alice creates room
+            ws_alice.send_text(json.dumps({
+                "type": "create_room",
+                "requestId": "req_create",
+                "payload": {"name": "Alice", "participantsCount": 3}
+            }))
+            res_create = json.loads(ws_alice.receive_text())
+            self.assertTrue(res_create["success"])
+            room_code = res_create["data"]["room"]["code"]
+            alice_id = res_create["data"]["participantId"]
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+
+            # 2. Bob joins room
+            ws_bob.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "req_join_bob",
+                "payload": {"code": room_code, "name": "Bob"}
+            }))
+            res_bob = json.loads(ws_bob.receive_text())
+            self.assertTrue(res_bob["success"])
+            bob_id = res_bob["data"]["participantId"]
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+
+            # 3. Carol joins room
+            ws_carol.send_text(json.dumps({
+                "type": "join_room",
+                "requestId": "req_join_carol",
+                "payload": {"code": room_code, "name": "Carol"}
+            }))
+            res_carol = json.loads(ws_carol.receive_text())
+            self.assertTrue(res_carol["success"])
+            carol_id = res_carol["data"]["participantId"]
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+
+            # 4. Alice starts protocol
+            ws_alice.send_text(json.dumps({
+                "type": "start_protocol",
+                "requestId": "req_start",
+                "payload": {}
+            }))
+            _ = json.loads(ws_alice.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # protocol_started
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # protocol_started
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # protocol_started
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # 5. Commit phase: Generate secrets and commitments
+            sec_alice = generate_secret()
+            sec_bob = generate_secret()
+            sec_carol = generate_secret()
+
+            comm_alice = compute_commitment(alice_id, sec_alice)
+            comm_bob = compute_commitment(bob_id, sec_bob)
+            comm_carol = compute_commitment(carol_id, sec_carol)
+
+            # Alice commits
+            ws_alice.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_alice",
+                "payload": {"commitment": comm_alice}
+            }))
+            _ = json.loads(ws_alice.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # Bob commits
+            ws_bob.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_bob",
+                "payload": {"commitment": comm_bob}
+            }))
+            _ = json.loads(ws_bob.receive_text())    # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # Carol commits -> Commitments locked -> Reveal phase opened
+            ws_carol.send_text(json.dumps({
+                "type": "submit_commitment",
+                "requestId": "comm_carol",
+                "payload": {"commitment": comm_carol}
+            }))
+            _ = json.loads(ws_carol.receive_text())  # ack
+            _ = json.loads(ws_alice.receive_text())  # commitments_locked
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # commitments_locked
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # commitments_locked
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # 6. Reveal phase: Alice reveals, privacy verified
+            ws_alice.send_text(json.dumps({
+                "type": "submit_reveal",
+                "requestId": "rev_alice",
+                "payload": {"secret": sec_alice}
+            }))
+            rev_ack = json.loads(ws_alice.receive_text())
+            self.assertTrue(rev_ack["data"]["verified"])
+
+            upd_a = json.loads(ws_alice.receive_text())
+            upd_b = json.loads(ws_bob.receive_text())
+            upd_c = json.loads(ws_carol.receive_text())
+
+            # Bob and Carol verify Alice's secret is NOT in public broadcast
+            bob_sees_alice = next(p for p in upd_b["data"]["participants"] if p["id"] == alice_id)
+            self.assertIsNone(bob_sees_alice["revealedSecret"])
+            self.assertNotIn(sec_alice, json.dumps(upd_b))
+
+            carol_sees_alice = next(p for p in upd_c["data"]["participants"] if p["id"] == alice_id)
+            self.assertIsNone(carol_sees_alice["revealedSecret"])
+            self.assertNotIn(sec_alice, json.dumps(upd_c))
+
+            # Bob reveals
+            ws_bob.send_text(json.dumps({
+                "type": "submit_reveal",
+                "requestId": "rev_bob",
+                "payload": {"secret": sec_bob}
+            }))
+            _ = json.loads(ws_bob.receive_text())    # ack
+            _ = json.loads(ws_alice.receive_text())  # room_updated
+            _ = json.loads(ws_bob.receive_text())    # room_updated
+            _ = json.loads(ws_carol.receive_text())  # room_updated
+
+            # Carol reveals -> Synchronized disclosure & final winner announced
+            ws_carol.send_text(json.dumps({
+                "type": "submit_reveal",
+                "requestId": "rev_carol",
+                "payload": {"secret": sec_carol}
+            }))
+            _ = json.loads(ws_carol.receive_text())  # ack
+
+            winner_alice = json.loads(ws_alice.receive_text())
+            winner_bob = json.loads(ws_bob.receive_text())
+            winner_carol = json.loads(ws_carol.receive_text())
+
+            self.assertEqual(winner_alice["event"], "winner_announced")
+            self.assertEqual(winner_bob["event"], "winner_announced")
+            self.assertEqual(winner_carol["event"], "winner_announced")
+
+            winner_result = winner_alice["data"]["result"]
+            self.assertIn(winner_result["winner"]["name"], ["Alice", "Bob", "Carol"])
+            self.assertEqual(winner_alice["data"]["state"], STATES["COMPLETED"])
+
+            # Verify cryptographic audit trail contains all 3 secrets
+            audit_secrets = [item["revealedSecret"] for item in winner_result["auditTrail"]]
+            self.assertIn(sec_alice, audit_secrets)
+            self.assertIn(sec_bob, audit_secrets)
+            self.assertIn(sec_carol, audit_secrets)
+
+
 if __name__ == "__main__":
     unittest.main()
+

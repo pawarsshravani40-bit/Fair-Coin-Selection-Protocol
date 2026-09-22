@@ -116,6 +116,8 @@ class Participant:
         self.is_revealed = False
         self.is_attacking = False
         self.is_timeout = False
+        self.session_token: str = secrets.token_hex(32)
+        self.connected: bool = True
         # Secret held locally (bots generate and keep it in memory)
         self.bot_secret: Optional[str] = None
 
@@ -138,6 +140,17 @@ class Room:
         # Add host
         clean_name = str(host_name).strip()[:30] or "Host"
         self.participants[host_id] = Participant(host_id, clean_name, is_host=True)
+
+    def verify_session(self, pid: str, session_token: str) -> Optional[Participant]:
+        """Timing-safe session verification for secure reconnection."""
+        p = self.participants.get(pid)
+        if not p:
+            return None
+        if not hmac.compare_digest(p.session_token, str(session_token).strip()):
+            return None
+        p.connected = True
+        self.last_active = time.time()
+        return p
 
     def add_participant(self, pid: str, name: str, is_bot: bool = False) -> Participant:
         if self.state != STATES["LOBBY"]:
@@ -367,6 +380,7 @@ class Room:
                     "isRevealed": p.is_revealed,
                     "isAttacking": p.is_attacking if is_finalized else False,
                     "isTimeout": p.is_timeout,
+                    "connected": p.connected,
                 }
                 for p in self.participants.values()
             ],
@@ -434,112 +448,24 @@ room_manager = RoomManager()
 ws_clients: Dict[WebSocket, str] = {}
 client_rooms: Dict[str, str] = {}
 room_subscribers: Dict[str, Set[WebSocket]] = {}
+MAX_MESSAGE_SIZE = 65536  # 64 KB message size limit
 
-SOCKET_IO_SHIM_JS = """
-(function () {
-  class SocketShim {
-    constructor() {
-      this.listeners = {};
-      this.ackCallbacks = {};
-      this.ackCounter = 0;
-      this.id = 'usr_' + Math.random().toString(36).substring(2, 9) + Date.now().toString(36);
-      this.connected = false;
-      this.queue = [];
-
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = proto + '//' + location.host + '/ws';
-      this.ws = new WebSocket(wsUrl);
-
-      this.ws.onopen = () => {
-        this.connected = true;
-        this.ws.send(JSON.stringify({ type: 'handshake', id: this.id }));
-        while (this.queue.length > 0) {
-          const item = this.queue.shift();
-          this.ws.send(JSON.stringify(item));
-        }
-      };
-
-      this.ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data);
-          if (msg.type === 'handshake_ack') {
-            this.id = msg.id;
-            this._fire('connect');
-          } else if (msg.type === 'ack') {
-            const cb = this.ackCallbacks[msg.ackId];
-            if (cb) {
-              delete this.ackCallbacks[msg.ackId];
-              cb(msg.data);
-            }
-          } else if (msg.type === 'event') {
-            this._fire(msg.event, msg.data);
-          }
-        } catch (e) {
-          console.error('[WS error]', e);
-        }
-      };
-
-      this.ws.onclose = () => {
-        this.connected = false;
-        this._fire('disconnect');
-      };
+async def send_response(ws: WebSocket, request_id: Optional[str], success: bool, data: Optional[dict] = None, error: Optional[str] = None):
+    """Send a structured JSON response to a specific WebSocket connection."""
+    resp: Dict[str, Any] = {
+        "type": "response",
+        "success": success
     }
-
-    _fire(event, data) {
-      const fns = this.listeners[event] || [];
-      fns.forEach((fn) => {
-        try { fn(data); } catch (e) { console.error(e); }
-      });
-    }
-
-    on(event, callback) {
-      if (!this.listeners[event]) {
-        this.listeners[event] = [];
-      }
-      this.listeners[event].push(callback);
-      if (event === 'connect' && this.connected) {
-        setTimeout(() => callback(), 0);
-      }
-    }
-
-    emit(event, data, callback) {
-      let payload = data;
-      let cb = callback;
-      if (typeof data === 'function') {
-        cb = data;
-        payload = {};
-      }
-
-      let ackId = null;
-      if (typeof cb === 'function') {
-        ackId = ++this.ackCounter;
-        this.ackCallbacks[ackId] = cb;
-      }
-
-      const pkt = {
-        type: 'emit',
-        event: event,
-        data: payload || {},
-        ackId: ackId
-      };
-
-      if (this.connected && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(pkt));
-      } else {
-        this.queue.push(pkt);
-      }
-    }
-  }
-
-  window.io = function () {
-    return new SocketShim();
-  };
-})();
-"""
-
-@app.get("/socket.io/socket.io.js")
-async def get_socketio_shim():
-    return Response(content=SOCKET_IO_SHIM_JS, media_type="application/javascript")
+    if request_id is not None:
+        resp["requestId"] = request_id
+        resp["ackId"] = request_id  # compatibility
+    if success:
+        resp["data"] = data or {}
+    else:
+        err_str = str(error or "Unknown error")
+        resp["error"] = err_str
+        resp["data"] = {"success": False, "error": err_str}
+    await ws.send_text(json.dumps(resp))
 
 @app.get("/api/simulate")
 async def simulate(
@@ -580,7 +506,7 @@ async def broadcast_to_room(room_code: str, event: str, data: dict):
     subs = room_subscribers.get(room_code, set())
     message = json.dumps({"type": "event", "event": event, "data": data})
     dead = []
-    for ws in subs:
+    for ws in list(subs):
         try:
             await ws.send_text(message)
         except Exception:
@@ -618,6 +544,12 @@ async def schedule_reveal_timer(room_code: str, duration: float):
         await broadcast_to_room(room.code, "room_updated", state)
 
 
+VALID_ACTIONS = {
+    "create_room", "join_room", "reconnect", "start_protocol",
+    "add_bot", "submit_commitment", "submit_reveal",
+    "simulate_attack", "force_timeout", "handshake"
+}
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -627,31 +559,114 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             text = await websocket.receive_text()
-            msg = json.loads(text)
-            mtype = msg.get("type")
+            if len(text) > MAX_MESSAGE_SIZE:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "error": "Payload exceeds maximum allowed size"
+                }))
+                continue
 
-            if mtype == "handshake":
-                client_id = msg.get("id") or f"client_{secrets.token_hex(4)}"
+            try:
+                msg = json.loads(text)
+            except Exception:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "error": "Malformed JSON message"
+                }))
+                continue
+
+            if not isinstance(msg, dict):
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "error": "Message must be a JSON object"
+                }))
+                continue
+
+            raw_type = msg.get("type")
+            if raw_type == "emit":
+                action = msg.get("event")
+            else:
+                action = raw_type
+
+            if not action or not isinstance(action, str):
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "error": "Missing or invalid message type"
+                }))
+                continue
+
+            request_id = msg.get("requestId") or msg.get("ackId")
+
+            if isinstance(msg.get("payload"), dict):
+                payload = msg.get("payload")
+            elif isinstance(msg.get("data"), dict):
+                payload = msg.get("data")
+            else:
+                payload = {}
+
+            if action not in VALID_ACTIONS:
+                await send_response(websocket, request_id, False, error=f"Unknown message type: {action}")
+                continue
+
+            # Handshake (compatibility)
+            if action == "handshake":
+                client_id = payload.get("id") or msg.get("id") or f"client_{secrets.token_hex(4)}"
                 ws_clients[websocket] = client_id
                 await websocket.send_text(json.dumps({"type": "handshake_ack", "id": client_id}))
+                continue
 
-            elif mtype == "emit":
-                event = msg.get("event")
-                data = msg.get("data", {})
-                ack_id = msg.get("ackId")
+            # 1. CREATE ROOM
+            if action == "create_room":
+                raw_name = str(payload.get("name", "Host")).strip()
+                name = raw_name[:30] if raw_name else "Host"
+                try:
+                    count = int(payload.get("participantsCount", 3))
+                except (ValueError, TypeError):
+                    count = 3
+                count = max(3, min(20, count))
 
-                resp_data = {"success": False}
+                if not client_id:
+                    client_id = f"usr_{secrets.token_hex(6)}"
 
-                if event == "create_room":
-                    raw_name = str(data.get("name", "Host")).strip()
-                    name = raw_name[:30] if raw_name else "Host"
-                    try:
-                        count = int(data.get("participantsCount", 3))
-                    except (ValueError, TypeError):
-                        count = 3
-                    count = max(3, min(20, count))
+                room = room_manager.create_room(client_id, name, count)
+                current_room_code = room.code
+                client_rooms[client_id] = room.code
 
-                    room = room_manager.create_room(client_id, name, count)
+                if room.code not in room_subscribers:
+                    room_subscribers[room.code] = set()
+                room_subscribers[room.code].add(websocket)
+
+                p = room.participants[client_id]
+                state = room.get_public_state()
+
+                await send_response(websocket, request_id, True, {
+                    "room": state,
+                    "participantId": client_id,
+                    "sessionToken": p.session_token
+                })
+                await broadcast_to_room(room.code, "room_updated", state)
+                continue
+
+            # 2. JOIN ROOM
+            elif action == "join_room":
+                raw_code = str(payload.get("code", "")).strip().upper()
+                raw_name = str(payload.get("name", "Guest")).strip()
+                name = raw_name[:30] if raw_name else "Guest"
+
+                if len(raw_code) != 6 or not raw_code.isalnum():
+                    await send_response(websocket, request_id, False, error="Invalid room code format (must be 6 alphanumeric characters)")
+                    continue
+
+                room = room_manager.get_room(raw_code)
+                if not room:
+                    await send_response(websocket, request_id, False, error="Room not found")
+                    continue
+
+                try:
+                    if not client_id or client_id in room.participants:
+                        client_id = f"usr_{secrets.token_hex(6)}"
+
+                    p = room.add_participant(client_id, name)
                     current_room_code = room.code
                     client_rooms[client_id] = room.code
 
@@ -660,207 +675,206 @@ async def websocket_endpoint(websocket: WebSocket):
                     room_subscribers[room.code].add(websocket)
 
                     state = room.get_public_state()
-                    resp_data = {"success": True, "room": state, "participantId": client_id}
-                    if ack_id:
-                        await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": resp_data}))
+                    await send_response(websocket, request_id, True, {
+                        "room": state,
+                        "participantId": client_id,
+                        "sessionToken": p.session_token
+                    })
                     await broadcast_to_room(room.code, "room_updated", state)
                     continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
 
-                elif event == "join_room":
-                    raw_code = str(data.get("code", "")).strip().upper()
-                    raw_name = str(data.get("name", "Guest")).strip()
-                    name = raw_name[:30] if raw_name else "Guest"
+            # 3. RECONNECT / SESSION RECOVERY
+            elif action == "reconnect":
+                raw_code = str(payload.get("roomCode", "")).strip().upper()
+                req_pid = str(payload.get("participantId", "")).strip()
+                req_token = str(payload.get("sessionToken", "")).strip()
 
-                    if len(raw_code) != 6 or not raw_code.isalnum():
-                        resp_data = {"success": False, "error": "Invalid room code format (must be 6 alphanumeric characters)"}
-                    else:
-                        room = room_manager.get_room(raw_code)
-                        if not room:
-                            resp_data = {"success": False, "error": "Room not found"}
-                        else:
-                            try:
-                                room.add_participant(client_id, name)
-                                current_room_code = room.code
-                                client_rooms[client_id] = room.code
+                if len(raw_code) != 6 or not raw_code.isalnum():
+                    await send_response(websocket, request_id, False, error="Invalid room code format")
+                    continue
+                if not req_pid or not req_token:
+                    await send_response(websocket, request_id, False, error="participantId and sessionToken are required for reconnection")
+                    continue
 
-                                if room.code not in room_subscribers:
-                                    room_subscribers[room.code] = set()
-                                room_subscribers[room.code].add(websocket)
+                room = room_manager.get_room(raw_code)
+                if not room:
+                    await send_response(websocket, request_id, False, error="Room not found or session expired")
+                    continue
 
-                                state = room.get_public_state()
-                                resp_data = {"success": True, "room": state, "participantId": client_id}
-                                if ack_id:
-                                    await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": resp_data}))
-                                await broadcast_to_room(room.code, "room_updated", state)
-                                continue
-                            except Exception as e:
-                                resp_data = {"success": False, "error": str(e)}
+                p = room.verify_session(req_pid, req_token)
+                if not p:
+                    await send_response(websocket, request_id, False, error="Invalid session credential: authentication failed")
+                    continue
 
-                elif event == "add_bot":
-                    # Extra feature: add a simulated bot to allow single-player testing
-                    room = room_manager.get_room(current_room_code)
-                    if not room:
-                        resp_data = {"success": False, "error": "Not in a room"}
-                    else:
-                        try:
-                            bot_idx = len(room.participants) + 1
-                            bot_id = f"bot_{secrets.token_hex(4)}"
-                            bot_names = ["Bob (Bot)", "Charlie (Bot)", "Diana (Bot)", "Edward (Bot)"]
-                            b_name = bot_names[(bot_idx - 2) % len(bot_names)]
-                            room.add_participant(bot_id, b_name, is_bot=True)
-                            state = room.get_public_state()
-                            resp_data = {"success": True, "room": state}
-                            if ack_id:
-                                await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": resp_data}))
-                            await broadcast_to_room(room.code, "room_updated", state)
-                            continue
-                        except Exception as e:
-                            resp_data = {"success": False, "error": str(e)}
+                if current_room_code and current_room_code in room_subscribers:
+                    room_subscribers[current_room_code].discard(websocket)
 
-                elif event == "start_protocol":
-                    room = room_manager.get_room(current_room_code)
-                    if not room:
-                        resp_data = {"success": False, "error": "Not in a room"}
-                    else:
-                        try:
-                            state = room.start_protocol(client_id)
-                            # If there are bots, have them commit right away
-                            process_bots_commit(room)
-                            state = room.get_public_state()
+                client_id = p.id
+                current_room_code = room.code
+                ws_clients[websocket] = client_id
+                client_rooms[client_id] = room.code
 
-                            if ack_id:
-                                await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": {"success": True}}))
-                            await broadcast_to_room(room.code, "protocol_started", state)
-                            await broadcast_to_room(room.code, "room_updated", state)
-                            continue
-                        except Exception as e:
-                            resp_data = {"success": False, "error": str(e)}
+                if room.code not in room_subscribers:
+                    room_subscribers[room.code] = set()
+                room_subscribers[room.code].add(websocket)
 
-                elif event == "submit_commitment":
-                    room = room_manager.get_room(current_room_code)
-                    if not room:
-                        resp_data = {"success": False, "error": "Not in a room"}
-                    else:
-                        try:
-                            comm = str(data.get("commitment", "")).strip().lower()
-                            if not HEX_64_REGEX.match(comm):
-                                raise ValueError("Invalid commitment format: must be 64 hex characters")
+                state = room.get_public_state()
+                await send_response(websocket, request_id, True, {
+                    "room": state,
+                    "participantId": p.id,
+                    "sessionToken": p.session_token
+                })
+                await broadcast_to_room(room.code, "room_updated", state)
+                continue
 
-                            prev_state = room.state
-                            state = room.submit_commitment(client_id, comm)
+            # Common validation for room-scoped actions
+            room = room_manager.get_room(current_room_code)
+            if not room:
+                await send_response(websocket, request_id, False, error="Not in a room")
+                continue
+            if not client_id or client_id not in room.participants:
+                await send_response(websocket, request_id, False, error="Unauthorized: participant not in room")
+                continue
 
-                            process_bots_commit(room)
-                            state = room.get_public_state()
+            # 4. ADD BOT
+            if action == "add_bot":
+                try:
+                    bot_idx = len(room.participants) + 1
+                    bot_id = f"bot_{secrets.token_hex(4)}"
+                    bot_names = ["Bob (Bot)", "Charlie (Bot)", "Diana (Bot)", "Edward (Bot)"]
+                    b_name = bot_names[(bot_idx - 2) % len(bot_names)]
+                    room.add_participant(bot_id, b_name, is_bot=True)
+                    state = room.get_public_state()
+                    await send_response(websocket, request_id, True, {"room": state})
+                    await broadcast_to_room(room.code, "room_updated", state)
+                    continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
 
-                            if ack_id:
-                                await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": {"success": True}}))
+            # 5. START PROTOCOL
+            elif action == "start_protocol":
+                try:
+                    state = room.start_protocol(client_id)
+                    process_bots_commit(room)
+                    state = room.get_public_state()
+                    await send_response(websocket, request_id, True, {"room": state})
+                    await broadcast_to_room(room.code, "protocol_started", state)
+                    await broadcast_to_room(room.code, "room_updated", state)
+                    continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
 
-                            if prev_state == STATES["COMMIT"] and room.state == STATES["LOCKED"]:
-                                await broadcast_to_room(room.code, "commitments_locked", state)
-                                room.open_reveal_phase()
-                                asyncio.create_task(schedule_reveal_timer(room.code, room.reveal_duration_seconds))
-                                process_bots_reveal(room)
-                                state = room.get_public_state()
+            # 6. SUBMIT COMMITMENT
+            elif action == "submit_commitment":
+                try:
+                    comm = str(payload.get("commitment", "")).strip().lower()
+                    if not HEX_64_REGEX.match(comm):
+                        raise ValueError("Invalid commitment format: must be 64 hex characters")
 
-                                if room.state == STATES["COMPLETED"]:
-                                    await broadcast_to_room(room.code, "winner_announced", state)
-                                elif room.state == STATES["ABORTED"]:
-                                    await broadcast_to_room(room.code, "protocol_aborted", state)
+                    prev_state = room.state
+                    state = room.submit_commitment(client_id, comm)
+                    process_bots_commit(room)
+                    state = room.get_public_state()
 
-                            await broadcast_to_room(room.code, "room_updated", state)
-                            continue
-                        except Exception as e:
-                            resp_data = {"success": False, "error": str(e)}
+                    await send_response(websocket, request_id, True, {"success": True})
 
-                elif event == "submit_reveal":
-                    room = room_manager.get_room(current_room_code)
-                    if not room:
-                        resp_data = {"success": False, "error": "Not in a room"}
-                    else:
-                        try:
-                            sec = str(data.get("secret", "")).strip().lower()
-                            if not HEX_64_REGEX.match(sec):
-                                raise ValueError("Invalid secret format: must be 64 hex characters")
+                    if prev_state == STATES["COMMIT"] and room.state == STATES["LOCKED"]:
+                        await broadcast_to_room(room.code, "commitments_locked", state)
+                        room.open_reveal_phase()
+                        asyncio.create_task(schedule_reveal_timer(room.code, room.reveal_duration_seconds))
+                        process_bots_reveal(room)
+                        state = room.get_public_state()
 
-                            state = room.submit_reveal(client_id, sec)
-                            p = room.participants.get(client_id)
+                        if room.state == STATES["COMPLETED"]:
+                            await broadcast_to_room(room.code, "winner_announced", state)
+                        elif room.state == STATES["ABORTED"]:
+                            await broadcast_to_room(room.code, "protocol_aborted", state)
 
-                            if ack_id:
-                                await websocket.send_text(json.dumps({
-                                    "type": "ack",
-                                    "ackId": ack_id,
-                                    "data": {"success": True, "verified": p.verified if p else False}
-                                }))
+                    await broadcast_to_room(room.code, "room_updated", state)
+                    continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
 
-                            process_bots_reveal(room)
-                            state = room.get_public_state()
+            # 7. SUBMIT REVEAL
+            elif action == "submit_reveal":
+                try:
+                    sec = str(payload.get("secret", "")).strip().lower()
+                    if not HEX_64_REGEX.match(sec):
+                        raise ValueError("Invalid secret format: must be 64 hex characters")
 
-                            if room.state == STATES["COMPLETED"]:
-                                await broadcast_to_room(room.code, "winner_announced", state)
-                            elif room.state == STATES["ABORTED"]:
-                                await broadcast_to_room(room.code, "protocol_aborted", state)
+                    state = room.submit_reveal(client_id, sec)
+                    p = room.participants.get(client_id)
 
-                            await broadcast_to_room(room.code, "room_updated", state)
-                            continue
-                        except Exception as e:
-                            resp_data = {"success": False, "error": str(e)}
+                    await send_response(websocket, request_id, True, {
+                        "success": True,
+                        "verified": p.verified if p else False
+                    })
 
-                elif event == "simulate_attack":
-                    room = room_manager.get_room(current_room_code)
-                    if not room:
-                        resp_data = {"success": False, "error": "Not in a room"}
-                    else:
-                        try:
-                            corrupted = str(data.get("corruptedSecret", "")).strip().lower()
-                            if not HEX_64_REGEX.match(corrupted):
-                                raise ValueError("Corrupted secret must be 64 hex characters")
+                    process_bots_reveal(room)
+                    state = room.get_public_state()
 
-                            state = room.submit_reveal(client_id, corrupted)
-                            p = room.participants.get(client_id)
+                    if room.state == STATES["COMPLETED"]:
+                        await broadcast_to_room(room.code, "winner_announced", state)
+                    elif room.state == STATES["ABORTED"]:
+                        await broadcast_to_room(room.code, "protocol_aborted", state)
 
-                            if ack_id:
-                                await websocket.send_text(json.dumps({
-                                    "type": "ack",
-                                    "ackId": ack_id,
-                                    "data": {"success": True, "verified": False, "attackDetected": True}
-                                }))
+                    await broadcast_to_room(room.code, "room_updated", state)
+                    continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
 
-                            process_bots_reveal(room)
-                            state = room.get_public_state()
+            # 8. SIMULATE ATTACK
+            elif action == "simulate_attack":
+                try:
+                    corrupted = str(payload.get("corruptedSecret", "")).strip().lower()
+                    if not HEX_64_REGEX.match(corrupted):
+                        raise ValueError("Corrupted secret must be 64 hex characters")
 
-                            if room.state == STATES["COMPLETED"]:
-                                await broadcast_to_room(room.code, "winner_announced", state)
-                            elif room.state == STATES["ABORTED"]:
-                                await broadcast_to_room(room.code, "protocol_aborted", state)
+                    state = room.submit_reveal(client_id, corrupted)
+                    p = room.participants.get(client_id)
 
-                            await broadcast_to_room(room.code, "room_updated", state)
-                            continue
-                        except Exception as e:
-                            resp_data = {"success": False, "error": str(e)}
+                    await send_response(websocket, request_id, True, {
+                        "success": True,
+                        "verified": False,
+                        "attackDetected": True
+                    })
 
-                elif event == "force_timeout":
-                    room = room_manager.get_room(current_room_code)
-                    if not room:
-                        resp_data = {"success": False, "error": "Not in a room"}
-                    else:
-                        try:
-                            room.handle_timeout()
-                            state = room.get_public_state()
-                            resp_data = {"success": True}
-                            if ack_id:
-                                await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": resp_data}))
-                            if room.state == STATES["COMPLETED"]:
-                                await broadcast_to_room(room.code, "winner_announced", state)
-                            elif room.state == STATES["ABORTED"]:
-                                await broadcast_to_room(room.code, "protocol_aborted", state)
-                            await broadcast_to_room(room.code, "room_updated", state)
-                            continue
-                        except Exception as e:
-                            resp_data = {"success": False, "error": str(e)}
+                    process_bots_reveal(room)
+                    state = room.get_public_state()
 
-                # Send ack back if requested
-                if ack_id:
-                    await websocket.send_text(json.dumps({"type": "ack", "ackId": ack_id, "data": resp_data}))
+                    if room.state == STATES["COMPLETED"]:
+                        await broadcast_to_room(room.code, "winner_announced", state)
+                    elif room.state == STATES["ABORTED"]:
+                        await broadcast_to_room(room.code, "protocol_aborted", state)
+
+                    await broadcast_to_room(room.code, "room_updated", state)
+                    continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
+
+            # 9. FORCE TIMEOUT
+            elif action == "force_timeout":
+                try:
+                    room.handle_timeout()
+                    state = room.get_public_state()
+                    await send_response(websocket, request_id, True, {"success": True})
+                    if room.state == STATES["COMPLETED"]:
+                        await broadcast_to_room(room.code, "winner_announced", state)
+                    elif room.state == STATES["ABORTED"]:
+                        await broadcast_to_room(room.code, "protocol_aborted", state)
+                    await broadcast_to_room(room.code, "room_updated", state)
+                    continue
+                except Exception as e:
+                    await send_response(websocket, request_id, False, error=str(e))
+                    continue
 
     except WebSocketDisconnect:
         pass
@@ -872,10 +886,17 @@ async def websocket_endpoint(websocket: WebSocket):
             room_subscribers[current_room_code].discard(websocket)
             room = room_manager.get_room(current_room_code)
             if room and client_id:
-                room.remove_participant(client_id)
-                human_count = sum(1 for p in room.participants.values() if not p.is_bot and not p.is_timeout)
-                if human_count == 0 and room.state == STATES["LOBBY"]:
-                    room_manager.delete_room(current_room_code)
+                p = room.participants.get(client_id)
+                if p:
+                    p.connected = False
+                if room.state == STATES["LOBBY"]:
+                    room.remove_participant(client_id)
+                    human_count = sum(1 for part in room.participants.values() if not part.is_bot and part.connected)
+                    if human_count == 0:
+                        room_manager.delete_room(current_room_code)
+                    else:
+                        state = room.get_public_state()
+                        await broadcast_to_room(room.code, "room_updated", state)
                 else:
                     state = room.get_public_state()
                     await broadcast_to_room(room.code, "room_updated", state)

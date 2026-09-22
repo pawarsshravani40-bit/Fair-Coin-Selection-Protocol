@@ -4,16 +4,183 @@
  * Utilizes:
  * - Web Crypto API for cryptographically secure randomness (crypto.getRandomValues)
  * - Web Crypto API for SHA-256 hash digest (crypto.subtle.digest)
- * - Socket.IO for real-time multi-party protocol synchronization
+ * - Native Browser WebSocket API for multi-party protocol synchronization
  */
 
-// Initialize Socket.IO connection
-const socket = io();
+class NativeWebSocket {
+  constructor() {
+    this.listeners = {};
+    this.pendingRequests = {};
+    this.requestCounter = 0;
+    this.id = null;
+    this.ws = null;
+    this.reconnectTimer = null;
+    this.queue = [];
+    this.init();
+  }
+
+  init() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${proto}//${location.host}/ws`;
+    this.ws = new WebSocket(wsUrl);
+
+    this.ws.onopen = () => {
+      this._attemptAutoReconnectSession();
+      while (this.queue.length > 0) {
+        const item = this.queue.shift();
+        this.ws.send(JSON.stringify(item));
+      }
+      this._fire('connect');
+    };
+
+    this.ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'response' || msg.type === 'ack') {
+          const reqId = msg.requestId || msg.ackId;
+          const cb = this.pendingRequests[reqId];
+          if (cb) {
+            delete this.pendingRequests[reqId];
+            cb(msg.data || msg);
+          }
+        } else if (msg.type === 'event') {
+          this._fire(msg.event, msg.data);
+        } else if (msg.type === 'error') {
+          showAlert(msg.error || 'Server error', 'danger');
+        }
+      } catch (e) {
+        console.error('[WS parse error]', e);
+      }
+    };
+
+    this.ws.onclose = () => {
+      this._fire('disconnect');
+      if (!this.reconnectTimer) {
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          this.init();
+        }, 2000);
+      }
+    };
+
+    this.ws.onerror = (err) => {
+      console.warn('[WS connection error]', err);
+    };
+  }
+
+  _attemptAutoReconnectSession() {
+    const raw = sessionStorage.getItem('fair_coin_session');
+    if (!raw) return;
+    try {
+      const sess = JSON.parse(raw);
+      if (sess.roomCode && sess.participantId && sess.sessionToken) {
+        this.emit('reconnect', {
+          roomCode: sess.roomCode,
+          participantId: sess.participantId,
+          sessionToken: sess.sessionToken
+        }, (response) => {
+          if (response && response.success) {
+            this.id = sess.participantId;
+            state.participantId = sess.participantId;
+            state.participantName = sess.participantName || '';
+            state.isHost = !!sess.isHost;
+            state.roomCode = sess.roomCode;
+            state.sessionToken = sess.sessionToken;
+            state.localSecret = sess.localSecret || null;
+            state.localCommitment = sess.localCommitment || null;
+            state.hasCommitted = !!sess.hasCommitted;
+            state.hasRevealed = !!sess.hasRevealed;
+
+            const badge = document.getElementById('clientIdentityBadge');
+            if (badge) badge.textContent = `ID: ${state.participantId.slice(0, 8)}...`;
+            if (state.localSecret) {
+              const secDisp = document.getElementById('localSecretDisplay');
+              if (secDisp) secDisp.textContent = state.localSecret;
+            }
+            if (state.localCommitment) {
+              const commDisp = document.getElementById('localCommitmentDisplay');
+              if (commDisp) commDisp.textContent = state.localCommitment;
+            }
+            if (state.hasCommitted) {
+              const btn = document.getElementById('commitActionBtn');
+              if (btn) btn.textContent = '✓ Commitment Submitted';
+            }
+            if (state.hasRevealed) {
+              const btn = document.getElementById('revealActionBtn');
+              if (btn) btn.textContent = '✓ Secret Verified';
+            }
+
+            if (response.room) {
+              state.roomData = response.room;
+              if (response.room.state === 'LOBBY') {
+                updateLobbyUI(response.room);
+                showGameView('lobby');
+              } else {
+                updateProtocolUI(response.room);
+                showGameView('protocol');
+              }
+            }
+            showAlert('Session restored 🔄', 'info', 3000);
+          } else {
+            sessionStorage.removeItem('fair_coin_session');
+          }
+        });
+      }
+    } catch (e) {
+      sessionStorage.removeItem('fair_coin_session');
+    }
+  }
+
+  on(event, callback) {
+    if (!this.listeners[event]) this.listeners[event] = [];
+    this.listeners[event].push(callback);
+    if (event === 'connect' && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      setTimeout(() => callback(), 0);
+    }
+  }
+
+  _fire(event, data) {
+    const fns = this.listeners[event] || [];
+    fns.forEach((fn) => {
+      try { fn(data); } catch (e) { console.error(e); }
+    });
+  }
+
+  emit(type, payload, callback) {
+    let data = payload;
+    let cb = callback;
+    if (typeof payload === 'function') {
+      cb = payload;
+      data = {};
+    }
+
+    const reqId = 'req_' + (++this.requestCounter) + '_' + Math.random().toString(36).substring(2, 7);
+    if (typeof cb === 'function') {
+      this.pendingRequests[reqId] = cb;
+    }
+
+    const msg = {
+      type: type,
+      requestId: reqId,
+      payload: data || {}
+    };
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    } else {
+      this.queue.push(msg);
+    }
+  }
+}
+
+// Initialize native WebSocket client
+const socket = new NativeWebSocket();
 
 // Local Client State
 const state = {
   participantId: null,
   participantName: '',
+  sessionToken: null,
   isHost: false,
   roomCode: null,
   roomData: null,
@@ -127,10 +294,20 @@ document.getElementById('submitCreateBtn').addEventListener('click', () => {
     if (response.success) {
       state.participantId = response.participantId;
       state.participantName = name;
+      state.sessionToken = response.sessionToken;
       state.isHost = true;
       state.roomCode = response.room.code;
       state.roomData = response.room;
 
+      sessionStorage.setItem('fair_coin_session', JSON.stringify({
+        roomCode: state.roomCode,
+        participantId: state.participantId,
+        participantName: name,
+        sessionToken: state.sessionToken,
+        isHost: true
+      }));
+
+      document.getElementById('clientIdentityBadge').textContent = `ID: ${state.participantId.slice(0, 8)}...`;
       updateLobbyUI(response.room);
       showGameView('lobby');
     } else {
@@ -153,10 +330,20 @@ document.getElementById('submitJoinBtn').addEventListener('click', () => {
     if (response.success) {
       state.participantId = response.participantId;
       state.participantName = name;
+      state.sessionToken = response.sessionToken;
       state.isHost = false;
       state.roomCode = response.room.code;
       state.roomData = response.room;
 
+      sessionStorage.setItem('fair_coin_session', JSON.stringify({
+        roomCode: state.roomCode,
+        participantId: state.participantId,
+        participantName: name,
+        sessionToken: state.sessionToken,
+        isHost: false
+      }));
+
+      document.getElementById('clientIdentityBadge').textContent = `ID: ${state.participantId.slice(0, 8)}...`;
       updateLobbyUI(response.room);
       showGameView('lobby');
     } else {
@@ -256,6 +443,16 @@ commitActionBtn.addEventListener('click', async () => {
     if (response.success) {
       state.hasCommitted = true;
       commitActionBtn.textContent = '✓ Commitment Submitted';
+
+      // Persist in session storage for refresh recovery
+      try {
+        const sess = JSON.parse(sessionStorage.getItem('fair_coin_session') || '{}');
+        sess.localSecret = state.localSecret;
+        sess.localCommitment = state.localCommitment;
+        sess.hasCommitted = true;
+        sessionStorage.setItem('fair_coin_session', JSON.stringify(sess));
+      } catch (e) {}
+
       showAlert('Commitment submitted to server. Secret remains securely held in client memory.', 'info', 4000);
     } else {
       commitActionBtn.disabled = false;
@@ -279,6 +476,13 @@ revealActionBtn.addEventListener('click', () => {
     if (response.success) {
       state.hasRevealed = true;
       revealActionBtn.textContent = '✓ Secret Verified';
+
+      try {
+        const sess = JSON.parse(sessionStorage.getItem('fair_coin_session') || '{}');
+        sess.hasRevealed = true;
+        sessionStorage.setItem('fair_coin_session', JSON.stringify(sess));
+      } catch (e) {}
+
       showAlert('Secret revealed and verified by server.', 'info', 4000);
     } else {
       revealActionBtn.disabled = false;
@@ -330,13 +534,18 @@ toggleAuditBtn.addEventListener('click', () => {
 
 // Play Again Button
 document.getElementById('newGameBtn').addEventListener('click', () => {
+  sessionStorage.removeItem('fair_coin_session');
   location.reload();
 });
 
 // Socket Event Handlers
 socket.on('connect', () => {
-  state.participantId = socket.id;
-  document.getElementById('clientIdentityBadge').textContent = `Socket ID: ${socket.id.slice(0, 8)}...`;
+  const badge = document.getElementById('clientIdentityBadge');
+  if (badge) {
+    badge.textContent = state.participantId
+      ? `ID: ${state.participantId.slice(0, 8)}...`
+      : 'Connected (Native WebSocket)';
+  }
 });
 
 socket.on('room_updated', (room) => {
