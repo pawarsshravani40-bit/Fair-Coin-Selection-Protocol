@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Fair Coin Selection Protocol</title>
+  <meta name="description" content="Fair Pick coordinates a participant selection using commit–reveal contributions and independent browser verification.">
+  <title>Fair Pick — Verifiable Selection</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,65 +12,96 @@
     <!-- Header -->
     <header class="app-header">
       <div class="brand">
-        <span class="brand-shield">🛡️</span>
+        <span class="brand-mark" aria-hidden="true">FP</span>
         <div>
           <h1>FAIR PICK</h1>
-          <p class="subtitle">A Cryptographically Secure and Verifiable Random Selection Protocol for Multiple Participants</p>
+          <p class="subtitle">Commit–reveal selection with independent verification</p>
         </div>
       </div>
-      <nav class="nav-links">
-        <button id="navGameBtn" class="nav-btn active">Protocol Game</button>
-        <button id="navFairnessBtn" class="nav-btn">Fairness Simulation</button>
-        <button id="navAttackBtn" class="nav-btn">Security Lab</button>
-      </nav>
+      <div class="header-tools">
+        <nav class="nav-links" aria-label="Main navigation">
+          <button id="navGameBtn" class="nav-btn active" type="button">Protocol</button>
+          <button id="navHowBtn" class="nav-btn" type="button">How it works</button>
+          <button id="navFairnessBtn" class="nav-btn" type="button">Fairness tests</button>
+          <button id="navAttackBtn" class="nav-btn" type="button">Security Lab</button>
+        </nav>
+        <span id="connectionStatus" class="connection-status" role="status" aria-live="polite">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connectionStatusText">Connecting</span>
+        </span>
+      </div>
     </header>
 
     <!-- Notification Bar -->
-    <div id="alertBanner" class="alert-banner hidden"></div>
+    <div id="alertBanner" class="alert-banner hidden" role="status" aria-live="polite"></div>
 
     <!-- MAIN VIEW: PROTOCOL GAME -->
     <main id="gameSection" class="view-section">
       <!-- 1. HOME SCREEN -->
-      <section id="homeView" class="card hero-card">
-        <div class="hero-content">
-          <div class="hero-badge">Commit–Reveal Cryptography</div>
-          <h2>Unbiased Multi-Party Random Selection</h2>
+      <section id="homeView" class="home-view">
+        <div class="home-intro">
+          <p class="eyebrow">VERIFIABLE GROUP SELECTION</p>
+          <h2>Select one participant without letting anyone choose the outcome alone.</h2>
           <p class="hero-desc">
-            Select exactly one winner among 3–20 participants with provably equal probability (\(1/n\)),
-            backed by SHA-256 commitments, bitwise XOR entropy combination, and zero-bias rejection sampling.
+            Each participant commits to a private contribution before reveals begin. Fair Pick combines valid contributions
+            and lets every browser independently check the published result.
           </p>
           <div class="home-actions">
-            <button id="openCreateBtn" class="btn btn-primary btn-large">Create Game</button>
-            <button id="openJoinBtn" class="btn btn-secondary btn-large">Join Game</button>
+            <button id="openCreateBtn" class="btn btn-primary btn-large" type="button">Create room</button>
+            <button id="openJoinBtn" class="btn btn-secondary btn-large" type="button">Join room</button>
+          </div>
+        </div>
+
+        <div class="home-flow-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">PROTOCOL FLOW</p>
+              <h3>One contribution at a time</h3>
+            </div>
+            <span class="flow-caption">The browser verifies the completed result independently.</span>
+          </div>
+          <ol class="flow-strip" aria-label="Commit, lock, reveal, select, verify">
+            <li><span class="flow-index">01</span><span>Commit</span></li>
+            <li><span class="flow-index">02</span><span>Lock</span></li>
+            <li><span class="flow-index">03</span><span>Reveal</span></li>
+            <li><span class="flow-index">04</span><span>Select</span></li>
+            <li><span class="flow-index">05</span><span>Verify</span></li>
+          </ol>
+          <div class="home-footer-links">
+            <span>Review the protocol before starting.</span>
+            <button class="text-button" id="homeHowBtn" type="button">How it works <span aria-hidden="true">→</span></button>
+            <button class="text-button" id="homeLabBtn" type="button">Open Security Lab <span aria-hidden="true">→</span></button>
           </div>
         </div>
       </section>
 
       <!-- 2. CREATE GAME MODAL / FORM -->
       <section id="createView" class="card form-card hidden">
-        <h3>Create New Game</h3>
-        <p class="form-instruction">Configure session parameters as host</p>
+        <p class="eyebrow">NEW ROOM</p>
+        <h2>Create a room</h2>
+        <p class="form-instruction">Choose a display name and the total number of participants.</p>
         <div class="form-group">
           <label for="createNameInput">Your Name</label>
           <input type="text" id="createNameInput" placeholder="Alice" maxlength="24" value="Alice">
         </div>
         <div class="form-group">
-          <label for="createCountInput">Number of Participants (3 – 20)</label>
+          <label for="createCountRange">Participants (3–20)</label>
           <div class="range-row">
             <input type="range" id="createCountRange" min="3" max="20" value="3">
             <span id="createCountDisplay" class="count-badge">3</span>
           </div>
         </div>
         <div class="form-actions">
-          <button id="cancelCreateBtn" class="btn btn-outline">Cancel</button>
-          <button id="submitCreateBtn" class="btn btn-primary">Create Room</button>
+          <button id="cancelCreateBtn" class="btn btn-outline" type="button">Cancel</button>
+          <button id="submitCreateBtn" class="btn btn-primary" type="button">Create room</button>
         </div>
       </section>
 
       <!-- 3. JOIN GAME MODAL / FORM -->
       <section id="joinView" class="card form-card hidden">
-        <h3>Join Existing Game</h3>
-        <p class="form-instruction">Enter the 6-character room code from your host</p>
+        <p class="eyebrow">EXISTING ROOM</p>
+        <h2>Join a room</h2>
+        <p class="form-instruction">Enter your display name and the six-character code shared by the host.</p>
         <div class="form-group">
           <label for="joinNameInput">Your Name</label>
           <input type="text" id="joinNameInput" placeholder="Bob" maxlength="24" value="Bob">
@@ -79,8 +111,8 @@
           <input type="text" id="joinCodeInput" placeholder="e.g. 7X9K2A" maxlength="6" class="code-input">
         </div>
         <div class="form-actions">
-          <button id="cancelJoinBtn" class="btn btn-outline">Cancel</button>
-          <button id="submitJoinBtn" class="btn btn-primary">Join Room</button>
+          <button id="cancelJoinBtn" class="btn btn-outline" type="button">Cancel</button>
+          <button id="submitJoinBtn" class="btn btn-primary" type="button">Join room</button>
         </div>
       </section>
 
@@ -88,10 +120,10 @@
       <section id="lobbyView" class="card hidden">
         <div class="lobby-header">
           <div>
-            <span class="tag">ROOM LOBBY</span>
+            <span class="eyebrow">ROOM LOBBY</span>
             <div class="room-code-badge">
-              Room Code: <strong id="lobbyRoomCode">------</strong>
-              <button id="copyCodeBtn" class="btn btn-sm" title="Copy Code">📋 Copy</button>
+              <span>Room code</span><strong id="lobbyRoomCode">------</strong>
+              <button id="copyCodeBtn" class="btn btn-sm btn-outline" title="Copy room code" type="button">Copy code</button>
             </div>
           </div>
           <div class="participant-counter">
@@ -100,19 +132,27 @@
         </div>
 
         <div class="roster-container">
-          <h4>Participants in Lobby</h4>
+          <h3>Participants</h3>
           <ul id="lobbyRoster" class="participant-list"></ul>
         </div>
 
         <div class="lobby-actions">
-          <button id="startProtocolBtn" class="btn btn-primary btn-large hidden">Start Selection</button>
-          <button id="addBotBtn" class="btn btn-secondary btn-large hidden" style="margin-top: 0.5rem;">+ Add Bot Participant (Solo Test)</button>
+          <button id="startProtocolBtn" class="btn btn-primary btn-large hidden" type="button">Start selection</button>
+          <button id="addBotBtn" class="btn btn-secondary btn-large hidden" type="button">Add bot participant (solo test)</button>
           <div id="lobbyWaitingMsg" class="waiting-indicator">Waiting for all participants to join...</div>
         </div>
       </section>
 
       <!-- 5. PROTOCOL RUNTIME VIEW -->
       <section id="protocolView" class="card hidden">
+        <div class="protocol-heading">
+          <div>
+            <p class="eyebrow">LIVE PROTOCOL</p>
+            <h2>Participant contributions</h2>
+            <p class="form-instruction">Commitments are public; unrevealed contributions remain private.</p>
+          </div>
+          <span class="room-code-badge">Room <strong id="protocolRoomCode">------</strong></span>
+        </div>
         <!-- Stage Flow Progress -->
         <div class="protocol-stepper">
           <div id="stepCommit" class="step-item active">
@@ -132,7 +172,7 @@
           <div class="step-line"></div>
           <div id="stepWinner" class="step-item">
             <span class="step-num">4</span>
-            <span class="step-label">Winner</span>
+            <span class="step-label">Select</span>
           </div>
         </div>
 
@@ -167,30 +207,30 @@
           <!-- Secret generation and commit stage -->
           <div id="commitControls" class="control-row">
             <div class="crypto-preview">
-              <label>Your Client Secret (Generated locally with Web Crypto API):</label>
-              <div class="hash-box" id="localSecretDisplay">Pending generation...</div>
-              <label>Your Commitment: SHA-256(Participant ID || Secret)</label>
+              <label>Private contribution</label>
+              <div class="private-value-note" id="localSecretDisplay" role="status">Generated locally when you commit; hidden from the interface.</div>
+              <label>Your commitment: SHA-256(Participant ID + ":" + Secret)</label>
               <div class="hash-box" id="localCommitmentDisplay">Pending computation...</div>
             </div>
             <div class="action-buttons">
-              <button id="commitActionBtn" class="btn btn-primary">Generate & Commit Secret</button>
+              <button id="commitActionBtn" class="btn btn-primary" type="button">Generate &amp; commit</button>
             </div>
           </div>
 
           <!-- Reveal Stage -->
           <div id="revealControls" class="control-row hidden">
             <div class="crypto-preview">
-              <p class="info-text">Commitments are locked. Submit your secret to the server for SHA-256 verification.</p>
+              <p class="info-text">Commitments are locked. Reveal the same private contribution you committed to.</p>
             </div>
             <div class="action-buttons">
-              <button id="revealActionBtn" class="btn btn-success">Reveal Secret (Valid)</button>
-              <button id="attackDemoBtn" class="btn btn-danger">Simulate Cheating Attack</button>
+              <button id="revealActionBtn" class="btn btn-success" type="button">Reveal contribution</button>
+              <button id="attackDemoBtn" class="btn btn-danger" type="button">Test altered reveal</button>
             </div>
           </div>
 
           <!-- Timeout trigger -->
           <div id="timeoutControls" class="timeout-row hidden">
-            <button id="forceTimeoutBtn" class="btn btn-outline btn-sm">Force Timeout for Non-Revealers</button>
+            <button id="forceTimeoutBtn" class="btn btn-outline btn-sm" type="button">Process reveal timeout</button>
           </div>
         </div>
 
@@ -220,7 +260,7 @@
             <div id="verificationErrorDetail" class="verification-error-detail hidden"></div>
           </div>
 
-          <button id="toggleAuditBtn" class="btn btn-secondary">View Cryptographic Audit Details</button>
+          <button id="toggleAuditBtn" class="btn btn-secondary" type="button">View cryptographic audit details</button>
         </div>
 
         <!-- AUDIT & VERIFICATION DRAWER -->
@@ -266,11 +306,27 @@
       </section>
     </main>
 
+    <section id="howSection" class="view-section card hidden">
+      <div class="section-title">
+        <p class="eyebrow">PROTOCOL OVERVIEW</p>
+        <h2>How Fair Pick works</h2>
+        <p class="subtitle">The server coordinates the phases; each browser can independently verify the completed public audit.</p>
+      </div>
+      <ol class="how-steps">
+        <li><span class="flow-index">01</span><div><h3>Commit</h3><p>Each participant creates a private random contribution in their browser and submits only its SHA-256 commitment.</p></div></li>
+        <li><span class="flow-index">02</span><div><h3>Lock</h3><p>After all required commitments arrive, the commitment set is locked before the reveal phase.</p></div></li>
+        <li><span class="flow-index">03</span><div><h3>Reveal</h3><p>Participants submit the same contributions. The server verifies them against the locked commitments and applies its reveal deadline.</p></div></li>
+        <li><span class="flow-index">04</span><div><h3>Select and verify</h3><p>Valid contributions are combined with XOR and used by 64-bit rejection sampling. Browsers then independently check the audit and announced selection.</p></div></li>
+      </ol>
+      <p class="notice">This commit–reveal design has limits: a participant who withholds a reveal can affect whether a round completes. The server enforces a deadline and aborts if fewer than two valid reveals remain. Fairness also assumes at least one unpredictable, honest contribution.</p>
+    </section>
+
     <!-- FAIRNESS SIMULATION VIEW -->
     <section id="fairnessSection" class="view-section card hidden">
       <div class="section-title">
-        <h2>Statistical Fairness & Uniformity Testing</h2>
-        <p class="subtitle">Run thousands of automated selection simulations to empirically verify the \(1/n\) distribution</p>
+        <p class="eyebrow">ALGORITHM ANALYSIS</p>
+        <h2>Fairness simulation</h2>
+        <p class="subtitle">Explore the selection distribution and compare rejection sampling with naive modulo reduction.</p>
       </div>
 
       <div class="simulation-controls">
@@ -331,8 +387,9 @@
     <!-- SECURITY LAB VIEW -->
     <section id="attackSection" class="view-section card hidden">
       <div class="section-title">
-        <h2>Security Lab & Cryptographic Verification Sandbox</h2>
-        <p class="subtitle">Interactive simulations demonstrating preimage resistance, commitment binding, participant identity binding, and rejection sampling. Fully isolated from live game state.</p>
+        <p class="eyebrow">ISOLATED EXPERIMENTS</p>
+        <h2>Security Lab</h2>
+        <p class="subtitle">Explore how the client verifier responds to altered inputs and compare modulo reduction with rejection sampling. Experiments are isolated from live rooms.</p>
       </div>
 
       <!-- Security Lab Navigation Tabs -->
@@ -549,6 +606,6 @@
     </footer>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=ui-integration"></script>
 </body>
 </html>
