@@ -16,10 +16,12 @@ import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Protocol Constants
@@ -572,7 +574,60 @@ class RoomManager:
 # FastAPI Application & Native WebSocket Protocol Server
 # ---------------------------------------------------------------------------
 
+def normalize_origin(origin: str) -> str:
+    parsed = urlsplit(origin.strip())
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"Invalid origin in ALLOWED_ORIGINS: {origin!r}")
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def get_allowed_origins() -> Set[str]:
+    configured = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    if configured:
+        origins = [origin.strip() for origin in configured.split(",")]
+        if not all(origins):
+            raise ValueError("ALLOWED_ORIGINS must contain non-empty comma-separated origins.")
+        return {normalize_origin(origin) for origin in origins}
+
+    port = os.environ.get("PORT", "3000").strip()
+    local_origins = {
+        "http://testserver",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://[::1]:3000",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "http://[::1]:5500",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://[::1]:8000",
+    }
+    if port.isdigit():
+        local_origins.update({
+            f"http://localhost:{port}",
+            f"http://127.0.0.1:{port}",
+            f"http://[::1]:{port}",
+        })
+    return local_origins
+
+
+ALLOWED_ORIGINS = get_allowed_origins()
 app = FastAPI(title="Fair Coin Selection Protocol")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(ALLOWED_ORIGINS),
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 room_manager = RoomManager()
 sim_lock = asyncio.Lock()
 
@@ -691,6 +746,17 @@ VALID_ACTIONS = {
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    origin = websocket.headers.get("origin")
+    if origin is not None:
+        try:
+            normalized_origin = normalize_origin(origin)
+        except ValueError:
+            await websocket.close(code=1008)
+            return
+        if normalized_origin not in ALLOWED_ORIGINS:
+            await websocket.close(code=1008)
+            return
+
     await websocket.accept()
     client_id: Optional[str] = None
     current_room_code: Optional[str] = None
@@ -1072,10 +1138,13 @@ if public_dir.exists():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
+    port_value = os.environ.get("PORT")
+    if not port_value:
+        raise RuntimeError("Set the PORT environment variable before starting the server.")
+    port = int(port_value)
     print(f"\n=======================================================")
     print(f"  FAIR COIN SELECTION PROTOCOL (Python Backend)")
-    print(f"  Server running at: http://localhost:{port}")
+    print(f"  Listening on: 0.0.0.0:{port}")
     print(f"  Press Ctrl+C to stop the server")
     print(f"=======================================================\n")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

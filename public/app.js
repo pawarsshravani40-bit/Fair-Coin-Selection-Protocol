@@ -7,6 +7,49 @@
  * - Native Browser WebSocket API for multi-party protocol synchronization
  */
 
+function resolveBackendEndpoints() {
+  const config = window.FAIR_PICK_CONFIG || {};
+  const localHosts = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+  const isLocalDevelopment = localHosts.has(location.hostname);
+  const configuredApiBase = String(config.API_BASE_URL || '').trim();
+  const configuredWsBase = String(config.WS_BASE_URL || '').trim();
+
+  if (!configuredApiBase && !configuredWsBase && !isLocalDevelopment) {
+    throw new Error('Set API_BASE_URL and WS_BASE_URL in public/config.js for this deployment.');
+  }
+  if (Boolean(configuredApiBase) !== Boolean(configuredWsBase)) {
+    throw new Error('Configure both API_BASE_URL and WS_BASE_URL in public/config.js.');
+  }
+
+  const localApiBase = location.origin;
+  const localWsBase = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`;
+  const apiBase = configuredApiBase || localApiBase;
+  const wsBase = configuredWsBase || localWsBase;
+
+  function normalizeBaseUrl(value, name, allowedProtocols) {
+    let url;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error(`${name} must be an absolute URL.`);
+    }
+    if (!allowedProtocols.has(url.protocol) || url.username || url.password || url.search || url.hash) {
+      throw new Error(`${name} has an unsupported URL format.`);
+    }
+    if (url.pathname !== '/' && url.pathname !== '') {
+      throw new Error(`${name} must not include a path.`);
+    }
+    return `${url.protocol}//${url.host}`.replace(/\/+$/, '');
+  }
+
+  const apiUrl = normalizeBaseUrl(apiBase, 'API_BASE_URL', new Set(['http:', 'https:']));
+  const wsUrl = normalizeBaseUrl(wsBase, 'WS_BASE_URL', new Set(['ws:', 'wss:']));
+  if (location.protocol === 'https:' && (!apiUrl.startsWith('https://') || !wsUrl.startsWith('wss://'))) {
+    throw new Error('HTTPS deployments require HTTPS API and WSS backend URLs.');
+  }
+  return { apiBaseUrl: apiUrl, wsBaseUrl: wsUrl };
+}
+
 class NativeWebSocket {
   constructor() {
     this.listeners = {};
@@ -20,8 +63,18 @@ class NativeWebSocket {
   }
 
   init() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${location.host}/ws`;
+    let endpoints;
+    try {
+      endpoints = resolveBackendEndpoints();
+    } catch (error) {
+      const connectionStatus = document.getElementById('connectionStatus');
+      const connectionStatusText = document.getElementById('connectionStatusText');
+      if (connectionStatus) connectionStatus.classList.add('disconnected');
+      if (connectionStatusText) connectionStatusText.textContent = 'Backend URL not configured';
+      showAlert(error.message, 'danger', 0);
+      return;
+    }
+    const wsUrl = `${endpoints.wsBaseUrl}/ws`;
     this.ws = new WebSocket(wsUrl);
 
     this.ws.onopen = () => {
@@ -1114,7 +1167,8 @@ runSimBtn.addEventListener('click', async () => {
   runSimBtn.textContent = 'Simulating...';
 
   try {
-    const res = await fetch(`/api/simulate?n=${n}&trials=${trials}`);
+    const endpoints = resolveBackendEndpoints();
+    const res = await fetch(`${endpoints.apiBaseUrl}/api/simulate?n=${n}&trials=${trials}`);
     const data = await res.json();
 
     if (!res.ok) throw new Error(data.error);

@@ -209,16 +209,56 @@ An automated simulation suite is accessible via the web interface and HTTP endpo
 
 ### Prerequisites
 - Python 3.10 or higher.
-- `pip install fastapi uvicorn`
+- Install the backend runtime dependencies with `python -m pip install -r requirements.txt`.
 
 ### Starting the Server
-```bash
-python server.py
+```powershell
+$env:PORT = "3000"
+python -m uvicorn server:app --host 0.0.0.0 --port $env:PORT
 ```
 Open your browser and navigate to:
 ```text
 http://localhost:3000
 ```
+
+The server also supports direct startup with `python server.py`, provided `PORT` is set. For example, in PowerShell:
+
+```powershell
+$env:PORT = "3000"
+python server.py
+```
+
+### Production Deployment: Vercel Frontend and Persistent Backend
+
+The frontend is a static site in `public/`; `vercel.json` selects that directory and disables package installation/build steps. In Vercel, deploy this repository as a static project. No Vercel function or npm package is used. The separate backend must run as one persistent FastAPI process because active room/session state and protocol timers are held in memory.
+
+Set these backend environment variables:
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `PORT` | Yes | Port supplied by the persistent backend host. The ASGI process must bind to `0.0.0.0` and this port. |
+| `ALLOWED_ORIGINS` | Yes in production | Comma-separated exact browser origins, for example `https://fair-pick.example.edu`. Include every Vercel production/preview origin that should be allowed. Do not include paths or a trailing slash. |
+
+Use this backend startup command on the persistent host:
+
+```bash
+python -m uvicorn server:app --host 0.0.0.0 --port "$PORT"
+```
+
+Configure the public, non-secret backend URLs in `public/config.js` before deploying the frontend:
+
+```js
+window.FAIR_PICK_CONFIG = Object.freeze({
+  API_BASE_URL: 'https://<backend-domain>',
+  WS_BASE_URL: 'wss://<backend-domain>'
+});
+```
+
+Use the actual backend hostname in both values; do not add `/api/simulate` or `/ws`. The client appends those paths and removes trailing slashes. HTTPS-hosted frontends require an HTTPS API URL and a WSS WebSocket URL. These URLs are public configuration, not credentials; never place secrets there.
+
+When both config values are blank, loopback development pages use their own origin for HTTP and their corresponding `ws://` or `wss://` scheme for WebSockets. On a non-loopback host, missing or partial backend configuration is reported as an error rather than silently connecting to the frontend host. With `ALLOWED_ORIGINS` unset, the backend permits the project's local development origins (and the Starlette test origin); when set, it permits only the listed origins. HTTP CORS and the separate WebSocket Origin check use the same exact allowlist. WebSocket clients without an `Origin` header remain supported for non-browser use.
+
+The backend's `/api/simulate` endpoint remains at the backend origin and is requested cross-origin from Vercel. A backend process restart clears active rooms, session recovery state, and scheduled protocol timers; it does not persist or restore ongoing sessions.
 
 ---
 
@@ -251,6 +291,7 @@ Fair-Coin-Selection-Protocol/
 │   └── THREAT_MODEL.md          # Comprehensive threat model & security specifications
 ├── public/
 │   ├── app.js                   # Client protocol engine & independent verifier
+│   ├── config.js                # Public backend URL configuration
 │   ├── index.html               # Web interface, verification display & Security Lab
 │   └── style.css                # Interface styles & state badges
 ├── server/                      # Historical/legacy Node backend (retained for reference)
@@ -263,10 +304,12 @@ Fair-Coin-Selection-Protocol/
 ├── CODE_OF_CONDUCT.md           # Community guidelines
 ├── CONTRIBUTING.md              # Zero-npm contributor guidelines
 ├── README.md                    # System documentation (this file)
+├── requirements.txt             # Python runtime dependencies
 ├── SECURITY.md                  # Vulnerability disclosure policy
 ├── package.json                 # Historical Node package configuration (MIT licensed)
 ├── package-lock.json            # Historical Node lockfile
 ├── server.py                    # Active Python backend & protocol engine
+├── vercel.json                  # Static frontend output configuration
 └── test_server.py               # Complete automated test suite (88 tests)
 ```
 
@@ -277,7 +320,7 @@ Fair-Coin-Selection-Protocol/
 1. **Centralized Protocol Coordinator:** The active server is centralized. Independent client-side verification guarantees that server tampering of commitments, entropy, or winner calculation is detected, but the server is trusted for transport availability.
 2. **Selective Abort / Withholding:** A malicious participant who reveals last can observe others' secrets and withhold their own to force a timeout. Mitigated by exclusion and safe abort thresholds, but financial penalties (slashing/collateral) are outside the scope of this implementation.
 3. **In-Memory Volatility:** Active rooms reside in server memory. Process restart terminates ongoing sessions.
-4. **Historical Node Backend:** The files in `server/` and `test/` represent the legacy prototype. The active, production-ready system is `server.py` and `public/`.
+4. **Historical Node Backend:** The files in `server/` and `test/` represent the legacy prototype. The active implementation is `server.py` and `public/`.
 
 ---
 
