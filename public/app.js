@@ -41,7 +41,10 @@ class NativeWebSocket {
           const cb = this.pendingRequests[reqId];
           if (cb) {
             delete this.pendingRequests[reqId];
-            cb(msg.data || msg);
+            const response = msg.data && typeof msg.data === 'object'
+              ? { ...msg.data, success: msg.success, error: msg.error }
+              : msg;
+            cb(response);
           }
         } else if (msg.type === 'event') {
           this._fire(msg.event, msg.data);
@@ -95,7 +98,7 @@ class NativeWebSocket {
             if (badge) badge.textContent = `ID: ${state.participantId.slice(0, 8)}...`;
             if (state.localSecret) {
               const secDisp = document.getElementById('localSecretDisplay');
-              if (secDisp) secDisp.textContent = state.localSecret;
+              if (secDisp) secDisp.textContent = 'Private contribution retained locally for reveal; hidden from the interface.';
             }
             if (state.localCommitment) {
               const commDisp = document.getElementById('localCommitmentDisplay');
@@ -580,12 +583,14 @@ const views = {
   lobby: document.getElementById('lobbyView'),
   protocol: document.getElementById('protocolView'),
   fairness: document.getElementById('fairnessSection'),
+  how: document.getElementById('howSection'),
   attack: document.getElementById('attackSection'),
   gameSection: document.getElementById('gameSection')
 };
 
 const nav = {
   game: document.getElementById('navGameBtn'),
+  how: document.getElementById('navHowBtn'),
   fairness: document.getElementById('navFairnessBtn'),
   attack: document.getElementById('navAttackBtn')
 };
@@ -607,25 +612,31 @@ function showAlert(message, type = 'info', timeoutMs = 6000) {
 
 // Navigation Tab Switching
 function switchNav(activeNav) {
-  [nav.game, nav.fairness, nav.attack].forEach((b) => b.classList.remove('active'));
-  [views.gameSection, views.fairness, views.attack].forEach((v) => v.classList.add('hidden'));
+  [nav.game, nav.how, nav.fairness, nav.attack].forEach((b) => b.classList.remove('active'));
+  [views.gameSection, views.how, views.fairness, views.attack].forEach((v) => v.classList.add('hidden'));
 
   if (activeNav === 'game') {
     nav.game.classList.add('active');
     views.gameSection.classList.remove('hidden');
+  } else if (activeNav === 'how') {
+    nav.how.classList.add('active');
+    views.how.classList.remove('hidden');
   } else if (activeNav === 'fairness') {
     nav.fairness.classList.add('active');
     views.fairness.classList.remove('hidden');
   } else if (activeNav === 'attack') {
     nav.attack.classList.add('active');
     views.attack.classList.remove('hidden');
-    updateAttackSandboxHashes();
+    refreshSecurityLabPreviews();
   }
 }
 
 nav.game.addEventListener('click', () => switchNav('game'));
+nav.how.addEventListener('click', () => switchNav('how'));
 nav.fairness.addEventListener('click', () => switchNav('fairness'));
 nav.attack.addEventListener('click', () => switchNav('attack'));
+document.getElementById('homeHowBtn').addEventListener('click', () => switchNav('how'));
+document.getElementById('homeLabBtn').addEventListener('click', () => switchNav('attack'));
 
 // View Navigation within Game
 function showGameView(viewKey) {
@@ -797,9 +808,9 @@ commitActionBtn.addEventListener('click', async () => {
 
   // Generate 256-bit cryptographically secure secret locally
   state.localSecret = generateClientSecret();
-  document.getElementById('localSecretDisplay').textContent = state.localSecret;
+  document.getElementById('localSecretDisplay').textContent = 'Generated locally and held in this browser for reveal. Not shown here.';
 
-  // Compute SHA-256(participantId || secret) locally
+  // Compute SHA-256(participantId + ":" + secret) locally
   state.localCommitment = await computeClientCommitment(state.participantId, state.localSecret);
   document.getElementById('localCommitmentDisplay').textContent = state.localCommitment;
 
@@ -818,7 +829,7 @@ commitActionBtn.addEventListener('click', async () => {
         sessionStorage.setItem('fair_coin_session', JSON.stringify(sess));
       } catch (e) {}
 
-      showAlert('Commitment submitted to server. Secret remains securely held in client memory.', 'info', 4000);
+      showAlert('Commitment submitted. The matching contribution remains private in this browser until reveal.', 'info', 4000);
     } else {
       commitActionBtn.disabled = false;
       showAlert(response.error, 'danger');
@@ -905,12 +916,26 @@ document.getElementById('newGameBtn').addEventListener('click', () => {
 
 // Socket Event Handlers
 socket.on('connect', () => {
+  const connectionStatus = document.getElementById('connectionStatus');
+  const connectionStatusText = document.getElementById('connectionStatusText');
+  if (connectionStatus) connectionStatus.classList.add('connected');
+  if (connectionStatus) connectionStatus.classList.remove('disconnected');
+  if (connectionStatusText) connectionStatusText.textContent = 'Connected';
+
   const badge = document.getElementById('clientIdentityBadge');
   if (badge) {
     badge.textContent = state.participantId
       ? `ID: ${state.participantId.slice(0, 8)}...`
       : 'Connected (Native WebSocket)';
   }
+});
+
+socket.on('disconnect', () => {
+  const connectionStatus = document.getElementById('connectionStatus');
+  const connectionStatusText = document.getElementById('connectionStatusText');
+  if (connectionStatus) connectionStatus.classList.remove('connected');
+  if (connectionStatus) connectionStatus.classList.add('disconnected');
+  if (connectionStatusText) connectionStatusText.textContent = 'Connection lost — reconnecting';
 });
 
 socket.on('room_updated', (room) => {
@@ -962,6 +987,7 @@ socket.on('protocol_aborted', (room) => {
 // Update Protocol Runtime UI
 function updateProtocolUI(room) {
   showGameView('protocol');
+  document.getElementById('protocolRoomCode').textContent = room.code;
 
   // Update Stepper
   const steps = {
@@ -1033,11 +1059,13 @@ function updateProtocolUI(room) {
   const winnerSection = document.getElementById('winnerSection');
 
   if (room.state === 'COMMIT') {
+    winnerSection.classList.remove('result-failure');
     commitControls.classList.remove('hidden');
     revealControls.classList.add('hidden');
     timeoutControls.classList.add('hidden');
     winnerSection.classList.add('hidden');
   } else if (room.state === 'REVEAL') {
+    winnerSection.classList.remove('result-failure');
     commitControls.classList.add('hidden');
     revealControls.classList.remove('hidden');
     timeoutControls.classList.add('hidden');
@@ -1048,6 +1076,7 @@ function updateProtocolUI(room) {
     timeoutControls.classList.add('hidden');
 
     if (room.state === 'ABORTED') {
+      winnerSection.classList.add('result-failure');
       winnerSection.classList.remove('hidden');
       const crown = document.querySelector('.winner-crown');
       if (crown) crown.textContent = '⚠️';
@@ -1055,6 +1084,7 @@ function updateProtocolUI(room) {
       if (title) title.textContent = 'PROTOCOL ABORTED';
       document.getElementById('winnerNameDisplay').textContent = room.result?.error || 'Insufficient valid reveals (minimum 2 required).';
     } else if (room.result && room.result.winner) {
+      winnerSection.classList.remove('result-failure');
       winnerSection.classList.remove('hidden');
       const crown = document.querySelector('.winner-crown');
       if (crown) crown.textContent = '👑';
@@ -1320,7 +1350,7 @@ if (btnVerifySecretTamper) {
               <div>Participant ID: <code>${escapeHtml(pid)}</code></div>
               <div>Expected Commitment: <code>${escapeHtml(origCommit)}</code></div>
               <div>Computed from Tampered Secret: <code>${escapeHtml(tampCommit)}</code></div>
-              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: Preimage resistance ensures an attacker cannot change their secret after commitments are locked.</div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Changing the revealed value causes this verifier to detect a mismatch, assuming SHA-256 remains collision-resistant. The experiment does not prove every protocol assumption.</div>
             </div>
           </div>
         `;
@@ -1362,7 +1392,7 @@ if (btnVerifyCommTamper) {
             <div class="tamper-details">
               <div>Real Preimage Hash: <code>${escapeHtml(realHash)}</code></div>
               <div>Tampered Stored Commitment: <code>${escapeHtml(tamperedComm)}</code></div>
-              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: Audit integrity ensures neither participants nor server can tamper with committed hashes without instant detection.</div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Changing a stored commitment without changing its preimage is detectable here. This does not authenticate the audit source or prevent every coordinated alteration.</div>
             </div>
           </div>
         `;
@@ -1406,7 +1436,7 @@ if (btnVerifyIdTamper) {
             <div class="tamper-details">
               <div>Original ID Hash: <code>${escapeHtml(origComm)}</code></div>
               <div>Impersonator ID Hash: <code>${escapeHtml(tampComm)}</code></div>
-              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: SHA-256(Participant ID + ":" + Secret) binds the commitment to the sender's identity, preventing replay and impersonation attacks.</div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">Changing the participant ID changes the expected commitment. This binds the hash to the supplied ID; it does not authenticate a real-world identity or prevent replay of the same values.</div>
             </div>
           </div>
         `;
@@ -1445,7 +1475,7 @@ if (btnVerifyWinnerTamper) {
             <div class="tamper-details">
               <div>Independently Calculated Winner: <code>${escapeHtml(originalWinner.name)} (Index ${originalIndex})</code></div>
               <div>Fraudulent Server Winner: <code>${escapeHtml(fakeName)} (Index ${fakeIdx})</code></div>
-              <div style="margin-top:0.5rem; color:var(--accent-amber);">Security Guarantee: The client computes the winner independently from the verified entropy seed, rendering server-side outcome manipulation impossible.</div>
+              <div style="margin-top:0.5rem; color:var(--accent-amber);">An independent recomputation can detect a mismatch between this audit and the announced selection. It cannot prevent service disruption or remove the protocol's trust assumptions.</div>
             </div>
           </div>
         `;
